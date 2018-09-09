@@ -394,6 +394,18 @@ transient Node<E> last;
 - ArrayList 基于动态数组实现，LinkedList 基于双向链表实现；
 - ArrayList 支持随机访问，LinkedList 不支持；
 - LinkedList 在任意位置添加删除元素更快。
+ArrayList使用一个内置的数组来存储元素,这个数组的起始容量是10·当数组需要增长时,新的容量按如下公式获得:新容量=(旧容量*3)/2+1,也就是说每一次容量大概会增长,50%。这就意味着,如果你有一个包含大量元素的ArrayList对象,那么最终将有很大的空间会被浪费掉,这个浪费是由ArrayList的工作方式本身造成的。
+ArrayList和LinkedList在性能上各有优缺点,都有各自所适用的地方,总的说来可以描述如下:
+1·对ArrayList和LinkedList而言,在列表末尾增加一个元素所花的开销都是固定的。
+对ArrayList而言,主要是在内部数组中增加一项,指向所添加的元素,偶尔可能会导致对数
+组重新进行分配;而对LinkedList而言,这个开销是统一的,分配一个内部Entry对象。
+2.在ArrayList的中间插入或删除一个元素意味着这个列表中剩余的元素都会被移动;
+而在LinkedList的中间插入或删除一个元素的开销是固定的。
+3. LinkedList不支持高效的随机元素访问。
+4. ArrayList的空间浪费主要体现在在list列表的结尾预留一定的容量空间,而LinkedList
+的空间花费则体现在它的每一个元素都需要消耗相当的空间, LinkedList中有一个私有的内
+部类。
+可以这样说:当操作是在一列数据的后面添加数据而不是在前面或中间,并且需要随机地访问其中的元素时,使用ArrayList会提供比较好的性能;当你的操作是在一列数据的前面或中间添加或删除数据,并且按照顺序访问其中的元素时,就应该使用LinkedList了。
 
 ## HashMap
 
@@ -635,6 +647,10 @@ static int indexFor(int h, int length) {
 }
 ```
 
+HashMap的初始容量为什么设置为16
+http://www.cnblogs.com/chenssy/p/3521565.html
+首先, length为2的整数次幂的话, h&(length-1)就相当于对length取模,这样便保证了散列的均匀,同时也提升了效率;其次, length为2的整数次幂的话,为偶数,这样length-1为奇数,奇数的最后一位是1,这样便保证了h&(length-1)的最后一位可能为0,也可能为1(这取决于h的值) ,即与后的结果可能为偶数,也可能为奇数,这样便可以保证散列的均匀性,而如果length为奇数的话,很明显length-1为偶数,它的最后一位是0,这样h&(length-1)的最后一位肯定为0,即只能为偶数,这样任何hash值都只会被散列到数组的偶数下标位置上,这便浪费了近一半的空间,因此, length取2的整数次幂,是为了使不同hash值发生碰撞的概率较小,这样就能使元素在哈希表中均匀地散列。
+
 ### 5. 扩容-基本原理
 
 设 HashMap 的 table 长度为 M，需要存储的键值对数量为 N，如果哈希函数满足均匀性的要求，那么每条链表的长度大约为 N/M，因此平均查找次数的复杂度为 O(N/M)。
@@ -765,7 +781,7 @@ static final int tableSizeFor(int cap) {
 
 ### 8. 链表转红黑树
 
-从 JDK 1.8 开始，一个桶存储的链表长度大于 8 时会将链表转换为红黑树。
+HashMap解决冲突是采用链表,性能上就抱有一定疑问,如果说成百上千个节点在hash付发生碰撞,存储一个链表中,那么如果要查找其中一个节点,那就不可避免的花费O(N)的查找时间,这将是多么大的性能损失。这个问题终于在JDK8中得到了解决。再最坏的情况下,链表查找的时间复杂度为O(n)，而红黑树一直是O(logn)，这样会提高HashMap的效率。而JDK8中采用的是位桶+链表/红黑树(有关红黑树请查看红黑树)的方式,也是非线程安全的。当某个位桶的链表的长度达到某个阀值的时候,这个链表就将转换成红黑树。
 
 ### 9. 与 HashTable 的比较
 
@@ -773,7 +789,12 @@ static final int tableSizeFor(int cap) {
 - HashMap 可以插入键为 null 的 Entry。
 - HashMap 的迭代器是 fail-fast 迭代器。
 - HashMap 不能保证随着时间的推移 Map 中的元素次序是不变的。
+- HashMap 非线程安全。HashMap不安全的表现：
+1.不同线程put操作，改变了某一键值对的value,这样就容易get不到预期的值，而是不停在变的，这样显然是不安全的！
+2.多线程环境下，两个线程在put操作的时候，当扩容调用resize时候，可能导致形成环形链表。
 
+区别：
+第一,继承不同。第二Hashtable中的方法是同步的,而HashMap中的方法在缺省情况下是非同步的。在多线程并发的环境下,可以直接使用Hashtable, Hashtable的实现方法里面都添加了synchronized关键字来确保线程同步,但是要使用HashMap的话就要自己增加同步处理了。第三Hashtable中, key和value都不允许出现null值。在HashMap中, null可以作为键,这样的键只有一个;可以有一个或多个键所对应的值为null。当get()方法返回null值时,即可以表示HashMap中没有该键,也可以表示该键所对应的值为null。因此,在HashMap中不能由get()方法来判断HashMap中是否存在某个键,而应该用containsKey()方法来判断。第四,两个遍历方式的内部实现上不同。Hashtable. HashMap都使用了Iterator。而由于历史原因, Hashtable还使用了Enumeration的方式,另一个区别是HashMap的迭代器(Iterator)是fail-fast迭代器,而Hashtable的enumerator迭代器不是fail-fast的。第五哈,希值的使用不同, HashTable直接使用对象的hashCode。而HashMap重新计算hash值。第六Hashtable和HashMap它们两个内部实现方式的数组的初始大小和扩容的方式。HashTable.中hash数组默认大小是11,增加的方式是old*2+1,而hashmap是翻倍。HashMap中hash数组的默认大小是16,而且一定是2的指数。第七.Hashtable在求数组下标是通过除以length取余,而hashmap是与length-1进行与。
 ## ConcurrentHashMap
 
 ### 1. 存储结构
@@ -790,6 +811,8 @@ static final class HashEntry<K,V> {
 ConcurrentHashMap 和 HashMap 实现上类似，最主要的差别是 ConcurrentHashMap 采用了分段锁（Segment），每个分段锁维护着几个桶（HashEntry），多个线程可以同时访问不同分段锁上的桶，从而使其并发度更高（并发度就是 Segment 的个数）。
 
 Segment 继承自 ReentrantLock。
+
+ConcurrentHashMap中的HashEntry相对于HashMap中的Entry有一定的差异性: HashEntry中的value以及next都被volatile修饰， hashmap中的entry只有KEY是final的，这样在多线程读写过程中能够保持它们的可见性
 
 ```java
 static final class Segment<K,V> extends ReentrantLock implements Serializable {
