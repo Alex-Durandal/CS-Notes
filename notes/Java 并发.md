@@ -145,7 +145,8 @@ public static void main(String[] args) {
 
 ## 实现 Callable 接口
 
-与 Runnable 相比，Callable 可以有返回值，返回值通过 FutureTask 进行封装。
+与 Runnable 相比，Callable 可以有返回值，返回值通过 FutureTask 进行封装。callable与runnable一样，都是代表抽象的的计算任务，其中的，call方法作用与run一样，但是会返回一个值。Future表示一个任务的生命周期，并提供了相应的方法来判断是否已经完成或取消，以及获取任务的结果。ExecutorService中所有的submit方法都会返回一个future。
+
 
 ```java
 public class MyCallable implements Callable<Integer> {
@@ -186,6 +187,22 @@ public static void main(String[] args) {
 }
 ```
 
+## start()和run()的区别
+1. start():
+用start方法来启动线程，真正实现了多线程运行，这时无需等待run方法体代码执行完毕而直接继续执行下面的代码。通过调用Thread类的start()方法来启动一个线程，这时，此线程处于就绪(可运行)状态，并没有运行，一旦得到cpu时间片，就开始执行run()方法，这里方法run()称为线程体，它包含了要执行的这个线程的内容， Run方法运行结束，此线程随即终止。
+
+2. run():
+run()方法只是类的一个普通方法而已，如果直接调用Run方法，程序中依然只有主线程这一个线程，其程序执行路径还是只有一条，还是要顺序执行，还是要等待run方法体执行完毕后才可继续执行下面的代码，这样就没有达到写线程的目的。
+
+**总结**:调用start方法方可启动线程，而run方法只是thread的一个普通方法调用，还是在主线程里执行。
+ 
+
+## Callable和Runnable的区别如下:
+1. Callable定义的方法是call，而Runnable定义的方法是run。
+2. Callable的call方法可以有返回值，而Runnable的run方法不能有返回值。
+3. Callable的call方法可抛出异常，而Runnable的run方法不能抛出异常。
+
+
 ## 实现接口 VS 继承 Thread
 
 实现接口会更好一些，因为：
@@ -196,14 +213,25 @@ public static void main(String[] args) {
 # 三、基础线程机制
 
 ## Executor
+Java.concurrent下的Executors、 ExecutorServices我们运行一个线程都是显式调用了Thread的start()方法。我们用concurrent下面的类来实现一下线程的运行，而且这将成为以后常用的方法或者实现思路。ExecutorService中有一个execute方法，这个方法的参数是Runnable类型。也就是说，将一个实现了Runnable类型的类的实例作为参数传入execute方法并执行，那么线程就相应的执行了。
+ExecuteService继承了Executor， Executor也是一个接口，里面只有一个方法: void execute(Runnable command)。
+
+而ExecuteService中有方法submit，接受Runnable或者Callable任务并返回一个futrue对象
+
+```java
+<T> Future<T> submit(Callable<T> task);
+<T> Future<T> submit(Runnable task， T result);
+```
 
 Executor 管理多个异步任务的执行，而无需程序员显式地管理线程的生命周期。这里的异步是指多个任务的执行互不干扰，不需要进行同步操作。
 
-主要有三种 Executor：
+主要有四种 Executor：
 
-- CachedThreadPool：一个任务创建一个线程；
-- FixedThreadPool：所有任务只能使用固定大小的线程；
-- SingleThreadExecutor：相当于大小为 1 的 FixedThreadPool。
+- CachedThreadPool：一个任务创建一个线程，当当前需求小于线程池数量时，将回收一部分线程;若超过了线程池数量，则添加新的线程，线程池的规模不受限制。
+- FixedThreadPool：所有任务只能使用固定大小的线程，每提交一个任务就创建一个线程，直到达到最大数量。
+- SingleThreadExecutor：相当于大小为 1 的 FixedThreadPool。如果线程异常结束会创建一个新的线程。可以保证任务按照在队列中的顺序来串行执行。
+- ScheduledTreadPool：创建固定长度的线程池，且同时以延时或者定时的方法来执行任务。
+
 
 ```java
 public static void main(String[] args) {
@@ -214,6 +242,23 @@ public static void main(String[] args) {
     executorService.shutdown();
 }
 ```
+### 线程池的任务队列
+线程池对任务队列包括三种:有界队列、无界队列、同步移交。
+
+并发库中的BlockingQueue是一个比较好玩的类，顾名思义，就是阻塞队列。该类主要提供了两个方法put()和take()，前者将一个对象放到队列中，如果队列已经满了，就等待直到有空闲节点:后者从head取一个对象，如果没有对象，就等待直到有可取的对象。FixedThreadPool与SingleThreadPool都是采用无界的linkedBlockingQueue实现。
+
+LinkedBlockingQueue中引入了两把锁takeLock和putLock，显然分别是用于take操作和put。操作的。既LinkedBlockingQueue入队和出队用的是不同的锁，那么LinkedBlockingQueue可以同时进行入队和出队操作。但是由于使用链表实现，所有查找速度回慢一些。
+CacheThreadPool使用的是SyncronousQueue。
+
+无界队列：当请求不断增加时队列将无线增加，因此会出现资源耗尽的情况
+有界队列:如linkedblockingqueue，Arrayblockingqueue等，可以避免资源耗尽的情况。但是可能会出现队列填满的情况，该如何处理新任务?
+
+执行饱和策略:中止，抛出异常;抛弃:抛齐该任务;调用者运行:将任务返回给调用者。
+
+一般是任务的大小和线程池的大小一起调节。对于非常大的队列或者无界队列，里面的任务可能会长时间排队等待。可以直接使用同步移交交任务直接交给工作者线程执行。
+
+同步移交并不是真正的队列，只是一种线程之间交互的机制。
+
 
 ## Daemon
 
@@ -247,6 +292,7 @@ public void run() {
     }
 }
 ```
+
 
 ## yield()
 
@@ -500,6 +546,93 @@ public synchronized static void fun() {
 
 作用于整个类。
 
+## Synchronized实现
+
+synchronized的底层实现主要依靠[Lock-Free的队列](https://coolshell.cn/articles/8239.html)，基本思路是自旋后阻塞，竞争切换后继续竞争锁，稍微牺牲了公平性，但获得了高吞吐量。
+
+synrhronized关键字简洁、清晰、语义明确，因此即使有了Lock接口，使用的还是非常广泛。其应用层的语义是可以把任何一个非null对象 作为"锁"，当synchronized作用在方法上时，锁住的便是对象实例（this）；当作用在静态方法时锁住的便是对象对应的Class实例，因为 Class数据存在于永久带，因此静态方法锁相当于该类的一个全局锁；当synchronized作用于某一个对象实例时，锁住的便是对应的代码块。在 HotSpot JVM实现中，锁有个专门的名字：对象监视器。 
+
+### 线程状态及状态转换
+
+当多个线程同时请求某个对象监视器时，对象监视器会设置几种状态用来区分请求的线程：
+
+Contention List：所有请求锁的线程将被首先放置到该竞争队列
+
+Entry List：Contention List中那些有资格成为候选人的线程被移到Entry List
+
+Wait Set：那些调用wait方法被阻塞的线程被放置到Wait Set
+
+OnDeck：任何时刻最多只能有一个线程正在竞争锁，该线程称为OnDeck
+
+Owner：获得锁的线程称为Owner
+
+!Owner：释放锁的线程
+
+下图反映了个状态转换关系：
+
+<div align="center"> <img src="../pics//20121109112521_220.jpg" width=""/> </div><br>
+
+JVM底层又是如何实现synchronized的
+
+新请求锁的线程将首先被加入到ConetentionList中，当某个拥有锁的线程（Owner状态）调用unlock之后，如果发现 EntryList为空则从ContentionList中移动线程到EntryList，下面说明下ContentionList和EntryList 的实现方式：
+
+1. ContentionList 虚拟队列
+ContentionList并不是一个真正的Queue，而只是一个虚拟队列，原因在于ContentionList是由Node及其next指 针逻辑构成，并不存在一个Queue的数据结构。ContentionList是一个后进先出（LIFO）的队列，每次新加入Node时都会在队头进行， 通过CAS改变第一个节点的的指针为新增节点，同时设置新增节点的next指向后续节点，而取得操作则发生在队尾。显然，该结构其实是个Lock- Free的队列。
+
+因为只有Owner线程才能从队尾取元素，也即线程出列操作无争用，当然也就避免了CAS的ABA问题。
+
+<div align="center"> <img src="../pics//20121109112521_981.jpg" width=""/> </div><br>
+
+2. EntryList
+
+EntryList与ContentionList逻辑上同属等待队列，ContentionList会被线程并发访问，为了降低对 ContentionList队尾的争用，而建立EntryList。Owner线程在unlock时会从ContentionList中迁移线程到 EntryList，并会指定EntryList中的某个线程（一般为Head）为Ready（OnDeck）线程。Owner线程并不是把锁传递给 OnDeck线程，只是把竞争锁的权利交给OnDeck，OnDeck线程需要重新竞争锁。这样做虽然牺牲了一定的公平性，但极大的提高了整体吞吐量，在 Hotspot中把OnDeck的选择行为称之为“竞争切换”。
+
+OnDeck线程获得锁后即变为owner线程，无法获得锁则会依然留在EntryList中，考虑到公平性，在EntryList中的位置不 发生变化（依然在队头）。如果Owner线程被wait方法阻塞，则转移到WaitSet队列；如果在某个时刻被notify/notifyAll唤醒， 则再次转移到EntryList。
+
+被synchronized关键字修饰的代码块在被编译成字节码的时候会在该代码块开始和结束的时候插入monitorenter和moniterexist指令。任何对象都有一个monitor与之关联，当且一个monitor被持有后，它将处于锁定状态。线程执行到monitorenter指令时，将会尝试获取对象所对应的monitor的所有权，即尝试获得对象的锁。虚拟机在执行这两个指令的时候会检查对象的锁状态是否为空或当前线程是否已经拥有该对象锁如果是则将对象锁的计数器加1直接进入同步代码执行。如果不是当前线程就要阻塞等待等到锁释放。
+
+### 自旋锁
+
+那些处于ContetionList、EntryList、WaitSet中的线程均处于阻塞状态，阻塞操作由操作系统完成（在Linxu下通 过pthread_mutex_lock函数）。线程被阻塞后便进入内核（Linux）调度状态，这个会导致系统在用户态与内核态之间来回切换，严重影响 锁的性能
+
+缓解上述问题的办法便是自旋，其原理是：当发生争用时，若Owner线程能在很短的时间内释放锁，则那些正在争用线程可以稍微等一等（自旋）， 在Owner线程释放锁后，争用线程可能会立即得到锁，从而避免了系统阻塞。但Owner运行的时间可能会超出了临界值，争用线程自旋一段时间后还是无法 获得锁，这时争用线程则会停止自旋进入阻塞状态（后退）。基本思路就是自旋，不成功再阻塞，尽量降低阻塞的可能性，这对那些执行时间很短的代码块来说有非 常重要的性能提高。自旋锁有个更贴切的名字：自旋-指数后退锁，也即复合锁。很显然，自旋在多处理器上才有意义。
+
+还有个问题是，线程自旋时做些啥？其实啥都不做，可以执行几次for循环，可以执行几条空的汇编指令，目的是占着CPU不放，等待获取锁的机 会。所以说，自旋是把双刃剑，如果旋的时间过长会影响整体性能，时间过短又达不到延迟阻塞的目的。显然，自旋的周期选择显得非常重要，但这与操作系统、硬 件体系、系统的负载等诸多场景相关，很难选择，如果选择不当，不但性能得不到提高，可能还会下降，因此大家普遍认为自旋锁不具有扩展性。
+
+**自旋优化策略**
+
+对自旋锁周期的选择上，HotSpot认为最佳时间应是一个线程上下文切换的时间，但目前并没有做到。经过调查，目前只是通过汇编暂停了几个CPU周期，除了自旋周期选择，HotSpot还进行许多其他的自旋优化策略，具体如下：
+
+如果平均负载小于CPUs则一直自旋
+
+如果有超过(CPUs/2)个线程正在自旋，则后来线程直接阻塞
+
+如果正在自旋的线程发现Owner发生了变化则延迟自旋时间（自旋计数）或进入阻塞
+
+如果CPU处于节电模式则停止自旋
+
+自旋时间的最坏情况是CPU的存储延迟（CPU A存储了一个数据，到CPU B得知这个数据直接的时间差）
+
+自旋时会适当放弃线程优先级之间的差异
+
+那synchronized实现何时使用了自旋锁？答案是在线程进入ContentionList时，也即第一步操作前。线程在进入等待队列时 首先进行自旋尝试获得锁，如果不成功再进入等待队列。这对那些已经在等待队列中的线程来说，稍微显得不公平。还有一个不公平的地方是自旋线程可能会抢占了 Ready线程的锁。自旋锁由每个监视对象维护，每个监视对象一个。
+
+### JVM1.6偏向锁
+
+在JVM1.6中引入了偏向锁，偏向锁主要解决无竞争下的锁性能问题，首先我们看下无竞争下锁存在什么问题：
+
+现在几乎所有的锁都是可重入的，也即已经获得锁的线程可以多次锁住/解锁监视对象，按照之前的HotSpot设计，每次加锁/解锁都会涉及到一些CAS操 作（比如对等待队列的CAS操作），CAS操作会延迟本地调用，因此偏向锁的想法是一旦线程第一次获得了监视对象，之后让监视对象“偏向”这个 线程，之后的多次调用则可以避免CAS操作，说白了就是置个变量，如果发现为true则无需再走各种加锁/解锁流程。但还有很多概念需要解释、很多引入的 问题需要解决：
+
+
+### 偏向解除
+
+偏向锁引入的一个重要问题是，在多争用的场景下，如果另外一个线程争用偏向对象，拥有者需要释放偏向锁，而释放的过程会带来一些性能开销，但总体说来偏向锁带来的好处还是大于CAS代价的。
+
+
+[synchronized的实现](http://www.open-open.com/lib/view/open1352431526366.html)
+[锁优化](http://www.cnblogs.com/wade-luffy/p/5969418.html)
+
+
 ## ReentrantLock
 
 ReentrantLock 是 java.util.concurrent（J.U.C）包中的锁。
@@ -535,6 +668,39 @@ public static void main(String[] args) {
 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9
 ```
 
+## 实现
+[ReentrantLock实现原理](http://www.cnblogs.com/xrq730/p/4979021.html?utm_source=tuicool&utm_medium=referral)
+
+ReentrantLock是java.util.concurrent。locks中的一个可重入锁类。在高竞争条件下有更好的性能，且可以中断。ReentrantLock是基于AQS (AbstractQueuedSynchronizer)实现的。AQS是基于FIFO队列的实现，整个AQS是典型的模板模式的应用，设计得十分精巧，对于FIFO队列的各种操作在AQS中已经实现了， AQS的子类一般只需要重写tryAcquire(int arg)和tryRelease(int arg)两个方法即可。
+ReentrantLock中有一个抽象类Sync继承自AbstractQueuedSynchronizer， ReentrantLock根据传入构造方法的布尔型参数实例化出Sync的实现类FairSync和NonfairSync，分别表示公平的Sync和非公平的Sync。 Sync， FairSync和NonFairSync都是ReentrantLock的静态内部类。Sync是一个抽象类，而FairSync和NonFairSync则是具体类，分别对应了公平锁和非公平锁。由于ReentrantLock我们用的比较多的是非公平锁，所以看下非公平锁是如何实现的。假设线程1调用了ReentrantLock的lock)方法，那么线程1将会独占锁，整个调用链十分简单:
+
+<div align="center"> <img src="../pics//801753-20151119222416015-917511769.png.dms" width=""/> </div><br>
+
+第一个获取锁的线程就做了两件事情:
+
+1. 设置AbstractQueuedSynchronizer的state为1 (同步状态， 0表示未锁)
+2. 设置AbstractOwnableSynchronizer的thread为当前线程(这个是AQS父类，
+AbstractOwnableSynchronizer的属性，表示独占模式同步器的当前拥有者)
+
+``` java
+final void lock(){
+	if (compareAndSetState(0， 1))
+		setExclusiveOwnerThread(Thread。currentThread();
+	else
+		acquire(1);
+}
+```
+
+3. 当第二个线程想要获取锁时，会执行else，调用acquire方法，进而调用acquire中的tryacquire方法，若果tryacquire返回失败，则将其加入等待队列。
+
+## 使用场景
+
+1. 需要使用可重入锁时，即当该子程序正在运行时，可以再次进入并执行它(并行执行时，个别的执行结果，都符合设计时的预期)
+2. 并发竞争很高的情况下
+3. 需要使用可中断锁
+4. 尝试等待执行:如果发现该操作已经在执行，则尝试等待一段时间，等待超时则不执行
+5. 如果发现该操作已经在执行中则不再执行(有状态执行)，例如:用在定时任务时，如果任务执行时间可能超过下次计划执行时间，确保该有状态任务只有一个正在执行，忽略重复触发。
+
 
 ## 比较
 
@@ -542,15 +708,16 @@ public static void main(String[] args) {
 
 synchronized 是 JVM 实现的，而 ReentrantLock 是 JDK 实现的。
 
+synchronized在锁定时如果方法块抛出异常， JVM会自动将锁释放掉，不会因为出了异常没有释放锁造成线程死锁。但是Lock的话就享受不到JVM带来自动的功能，出现异常时必须在finally将锁释放掉，否则将会引起死锁。
+
 **2. 性能** 
 
 新版本 Java 对 synchronized 进行了很多优化，例如自旋锁等，synchronized 与 ReentrantLock 大致相同。
 
 **3. 等待可中断** 
 
-当持有锁的线程长期不释放锁的时候，正在等待的线程可以选择放弃等待，改为处理其他事情。
-
-ReentrantLock 可中断，而 synchronized 不行。
+Lock提供一种显示的，可轮询的定时的以及可中断的锁获取操作， synchronize是无法中断一个正在等候获得锁的线程，使用synchronize的线程在等待锁时是不能响应中断的。
+轮询锁:当不能同时获得所有的锁时，可以使用轮询锁或者定时锁避免死锁。当一个线程需要获取多个锁时，已获得一部分锁，但是另一部分不可得，此时会返回失败，释放已获得锁，重新尝试获取所有的锁。
 
 **4. 公平锁** 
 
@@ -560,11 +727,17 @@ synchronized 中的锁是非公平的，ReentrantLock 默认情况下也是非�
 
 **5. 锁绑定多个条件** 
 
-一个 ReentrantLock 可以同时绑定多个 Condition 对象。
+一个 ReentrantLock 可以同时绑定多个 Condition 对象,可以使用Condition进行线程之间的调度.
+
+Synchronized则使用Object对象本身的notify， wait， notityAll调度机制
+Condition是Java5以后出现的机制，它有更好的灵活性，而且在一个对象里面可以有多个Condition (即对象监视器)，则线程可以注册在不同的Condition，从而可以有选择性的调度线程，更加灵活。Synchronized就相当于整个对象只有一个单一的Condition (即该对象本身)所有的线程都注册在它身上，线程调度的时候之后调度所有注册线程，没有选择权，会出现相当大的问题
 
 ## 使用选择
 
 除非需要使用 ReentrantLock 的高级功能，否则优先使用 synchronized。这是因为 synchronized 是 JVM 实现的一种锁机制，JVM 原生地支持它，而 ReentrantLock 不是所有的 JDK 版本都支持。并且使用 synchronized 不用担心没有释放锁而导致死锁问题，因为 JVM 会确保锁的释放。
+
+再举个例子:当有多个线程读写文件时，读操作和写操作会发生冲突现象，写操作和写操作会发生冲突现象，但是读操作和读操作不会发生冲突现象。但是采用synchronized关键字来实现同步的话，就会导致一个问题:如果多个线程都只是进行读操作，所以当一个线程在进行读操作时，其他线程只能等待无法进行读操作。因此就需要一种机制来使得多个线程都只是进行读操作时，线程之间不会发生冲突，通过Lock就可以办到。另外，通过Lock可以知道线程有没有成功获取到锁。这个是synchronized无法办到的。
+
 
 # 六、线程之间的协作
 
@@ -730,6 +903,15 @@ after
 
 java.util.concurrent（J.U.C）大大提高了并发性能，AQS 被认为是 J.U.C 的核心。
 
+## AbstractQueuedSynchronizer (AQS)
+
+提供了一个基于FIFO队列，可以用于构建阻塞锁或者同步容器的基础框架，AQS是基于FIFO队列的实现，因此必然存在一个个节点，Node就是一个节点。对于FIFO队列的各种操作在AQS中已经实现了，AQS的子类一般只需要重写`tryAcquire(int arg)`和`tryRelease(int arg)`两个方法即可。成为依靠单个原子int值来表示状态的大多数同步器的一个有用基础。子类必须定义更改此状态的受保护方法，并定义哪种状态对于此对象意味着被获取或被释放。假定这些条件之后，此类中的其他方法就可以实现所有排队和阻塞机制。
+
+`tryAcquire(int arg)`试图在独占模式下获取对象状态。此方法应该查询是否允许它在独占模式下获取对象状态，如果允许，则获取它。可以用此方法来实现`Lock.tryLock()`方法。`Acquire(int)`以独占模式获取对象，忽略中断。通过至少调用一次`tryAcquire(int)`来实现此方法，并在成功时返回。否则在成功之前，一直调用`tryAcquire(int)`将线程加入队列，线程可能重复被阻塞或不被阻塞。可以使用此方法来实现`Lock.lock()`方法。
+
+tryRelease试图设置状态来反映独占模式下的一个释放。`release(int arg)`以独占模式释放对象。如果`tryRelease(int)`返回true，则通过消除一个或多个线程的阻塞来实现此方法。可以使用此方法来实现Lock.unlock()方法tryAcquireShared(int arg)试图在共享模式下获取对象状态。此方法应该查询是否允许它在共享模式下获取对象状态，如果允许，则获取它。
+tryReleaseShared(int arg)试图设置状态来反映共享模式下的一个释放。
+
 ## CountdownLatch
 
 用来控制一个线程等待多个线程。
@@ -812,6 +994,12 @@ public class CyclicBarrierExample {
 before..before..before..before..before..before..before..before..before..before..after..after..after..after..after..after..after..after..after..after..
 ```
 
+### CountDownLatch和CyclicBarrier的区别
+1. CyclicBarrier的某个线程运行到某个点上之后，该线程即停止运行，直到所有的线程都到达了这个点，所有线程才重新运行；CountDownLatch则不是，某线程运行到某个点上之后，只是给某个数值-1而已，该线程继续运行
+2. CyclicBarrier只能唤起一个任务，CountDownLatch可以唤起多个任务
+3. CyclicBarrier可重用，CountDownLatch不可重用，计数值为0该CountDownLatch就不可再用了
+
+
 ## Semaphore
 
 Semaphore 类似于操作系统中的信号量，可以控制对互斥资源的访问线程数。
@@ -849,6 +1037,13 @@ public class SemaphoreExample {
 ```
 
 # 八、J.U.C - 其它组件
+
+## ReadWriteLock
+
+ReentrantLock某些时候有局限。如果使用ReentrantLock，可能本身是为了防止线程A在写数据、线程B在读数据造成的数据不一致，但这样，如果线程C在读数据、线程D也在读数据，读数据是不会改变数据的，没有必要加锁，但是还是加锁了，降低了程序的性能。
+
+ReadWriteLock是一个读写锁接口，ReentrantReadWriteLock是ReadWriteLock接口的一个具体实现，实现了读写的分离，读锁是共享的，写锁是独占的，读和读之间不会互斥，读和写、写和读、写和写之间才会互斥，提升了读写的性能。
+[ReadWriteLock原理](https://blog.csdn.net/qq_19431333/article/details/70568478)
 
 ## FutureTask
 
@@ -1332,9 +1527,36 @@ synchronized 和 ReentrantLock。
 
 乐观锁需要操作和冲突检测这两个步骤具备原子性，这里就不能再使用互斥同步来保证了，只能靠硬件来完成。硬件支持的原子性操作最典型的是：比较并交换（Compare-and-Swap，CAS）。CAS 指令需要有 3 个操作数，分别是内存地址 V、旧的预期值 A 和新值 B。当执行操作时，只有当 V 的值等于 A，才将 V 的值更新为 B。
 
+#### CAS及SMP架构
+
+CAS为什么会引入本地延迟？这要从SMP（对称多处理器）架构说起，下图大概表明了SMP的结构：
+
+<div align="center"> <img src="../pics//20121109112521_777.jpg" width=""/> </div><br>
+
+其意思是所有的CPU会共享一条系统总线（BUS），靠此总线连接主存。每个核都有自己的一级缓存，各核相对于BUS对称分布，因此这种结构称为“对称多处理器”。
+
+而CAS的全称为Compare-And-Swap，是一条CPU的原子指令，其作用是让CPU比较后原子地更新某个位置的值，经过调查发现， 其实现方式是基于硬件平台的汇编指令，就是说CAS是靠硬件实现的，JVM只是封装了汇编调用，那些AtomicInteger类便是使用了这些封装后的 接口。
+
+Core1和Core2可能会同时把主存中某个位置的值Load到自己的L1 Cache中，当Core1在自己的L1 Cache中修改这个位置的值时，会通过总线，使Core2中L1 Cache对应的值“失效”，而Core2一旦发现自己L1 Cache中的值失效（称为Cache命中缺失）则会通过总线从内存中加载该地址最新的值，大家通过总线的来回通信称为“Cache一致性流量”，因为总 线被设计为固定的“通信能力”，如果Cache一致性流量过大，总线将成为瓶颈。而当Core1和Core2中的值再次一致时，称为“Cache一致 性”，从这个层面来说，锁设计的终极目标便是减少Cache一致性流量。
+
+而CAS恰好会导致Cache一致性流量，如果有很多线程都共享同一个对象，当某个Core CAS成功时必然会引起总线风暴，这就是所谓的本地延迟，本质上偏向锁就是为了消除CAS，降低Cache一致性流量。
+
+**Cache一致性：**
+
+上面提到Cache一致性，其实是有协议支持的，现在通用的协议是MESI（最早由Intel开始支持），具体参考：http://en.wikipedia.org/wiki/MESI_protocol，以后会仔细讲解这部分。
+
+**Cache一致性流量的例外情况：**
+
+其实也不是所有的CAS都会导致总线风暴，这跟Cache一致性协议有关，具体参考：http://blogs.oracle.com/dave/entry/biased_locking_in_hotspot
+
+NUMA(Non Uniform Memory Access Achitecture）架构：
+
+与SMP对应还有非对称多处理器架构，现在主要应用在一些高端处理器上，主要特点是没有总线，没有公用主存，每个Core有自己的内存，针对这种结构此处不做讨论。
+
 ### 2. AtomicInteger
 
-J.U.C 包里面的整数原子类 AtomicInteger 的方法调用了 Unsafe 类的 CAS 操作。
+
+J.U.C 包里面的整数原子类 AtomicInteger 的方法调用了 [Unsafe 类的 CAS 操作](http://www.cnblogs.com/xrq730/p/4976007.html)。
 
 以下代码使用了 AtomicInteger 执行了自增的操作。
 
