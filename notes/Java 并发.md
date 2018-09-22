@@ -195,7 +195,7 @@ public static void main(String[] args) {
 run()方法只是类的一个普通方法而已，如果直接调用Run方法，程序中依然只有主线程这一个线程，其程序执行路径还是只有一条，还是要顺序执行，还是要等待run方法体执行完毕后才可继续执行下面的代码，这样就没有达到写线程的目的。
 
 **总结**:调用start方法方可启动线程，而run方法只是thread的一个普通方法调用，还是在主线程里执行。
- 
+
 
 ## Callable和Runnable的区别如下:
 1. Callable定义的方法是call，而Runnable定义的方法是run。
