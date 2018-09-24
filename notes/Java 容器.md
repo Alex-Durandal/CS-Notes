@@ -799,8 +799,16 @@ HashMap解决冲突是采用链表,性能上就抱有一定疑问,如果说成�
 1.不同线程put操作，改变了某一键值对的value,这样就容易get不到预期的值，而是不停在变的，这样显然是不安全的！
 2.多线程环境下，两个线程在put操作的时候，当扩容调用resize时候，可能导致形成环形链表。
 
-区别：
-第一,继承不同。第二Hashtable中的方法是同步的,而HashMap中的方法在缺省情况下是非同步的。在多线程并发的环境下,可以直接使用Hashtable, Hashtable的实现方法里面都添加了synchronized关键字来确保线程同步,但是要使用HashMap的话就要自己增加同步处理了。第三Hashtable中, key和value都不允许出现null值。在HashMap中, null可以作为键,这样的键只有一个;可以有一个或多个键所对应的值为null。当get()方法返回null值时,即可以表示HashMap中没有该键,也可以表示该键所对应的值为null。因此,在HashMap中不能由get()方法来判断HashMap中是否存在某个键,而应该用containsKey()方法来判断。第四,两个遍历方式的内部实现上不同。Hashtable. HashMap都使用了Iterator。而由于历史原因, Hashtable还使用了Enumeration的方式,另一个区别是HashMap的迭代器(Iterator)是fail-fast迭代器,而Hashtable的enumerator迭代器不是fail-fast的。第五哈,希值的使用不同, HashTable直接使用对象的hashCode。而HashMap重新计算hash值。第六Hashtable和HashMap它们两个内部实现方式的数组的初始大小和扩容的方式。HashTable.中hash数组默认大小是11,增加的方式是old*2+1,而hashmap是翻倍。HashMap中hash数组的默认大小是16,而且一定是2的指数。第七.Hashtable在求数组下标是通过除以length取余,而hashmap是与length-1进行与。
+**区别**：
+
+1. 继承不同。
+2. Hashtable中的方法是同步的，而HashMap中的方法在缺省情况下是非同步的。在多线程并发的环境下，可以直接使用Hashtable，Hashtable的实现方法里面都添加了synchronized关键字来确保线程同步，但是要使用HashMap的话就要自己增加同步处理了。
+3. Hashtable中, key和value都不允许出现null值。在HashMap中，null可以作为键，这样的键只有一个；可以有一个或多个键所对应的值为null。当get()方法返回null值时，即可以表示HashMap中没有该键，也可以表示该键所对应的值为null。因此，在HashMap中不能由get()方法来判断HashMap中是否存在某个键，而应该用containsKey()方法来判断。
+4. 两个遍历方式的内部实现上不同。Hashtable。HashMap都使用了Iterator。而由于历史原因，Hashtable还使用了Enumeration的方式，另一个区别是HashMap的迭代器(Iterator)是fail-fast迭代器，而Hashtable的enumerator迭代器不是fail-fast的。
+5. 哈希值的使用不同，HashTable直接使用对象的hashCode。而HashMap重新计算hash值。
+6. Hashtable和HashMap它们两个内部实现方式的数组的初始大小和扩容的方式。HashTable中hash数组默认大小是11，增加的方式是old*2+1，而hashmap是翻倍。HashMap中hash数组的默认大小是16，而且一定是2的指数。
+7. Hashtable在求数组下标是通过除以length取余，而hashmap是与length-1进行与。
+
 ## ConcurrentHashMap
 
 ### 1. 存储结构

@@ -107,267 +107,316 @@ Spark存储模块主要有两个部分：通信层架构和存储层架构。
 
 ### 存储层架构
 
-分为RDD缓存和shuffle缓存。RDD由不同的分区组成，所有计算操作都是以分区为单位。存储时RDD又是由不同的数据块组成，本质上分区和数据块是等价的。Spark中存储的最小管理单元是数据块，对Block的查询、存储管理，是通过唯一的Block ID来进行区分的。Spark可以在内存和磁盘中对RDD进行持久化，分别对应了内存和磁盘的存储管理。
+分为RDD缓存和shuffle缓存。RDD由不同的分区组成，所有计算操作都是以**分区**为单位。存储时RDD又是由不同的数据块组成，本质上分区和数据块是等价的。Spark中存储的最小管理单元是数据块，对Block的查询、存储管理，是通过唯一的Block ID来进行区分的。Spark可以在内存和磁盘中对RDD进行持久化，分别对应了内存和磁盘的存储管理。
 
-内存管理：
+**内存管理：**
 
 作为一个 JVM 进程，Executor 的内存管理建立在 JVM 的内存管理之上，Spark 对 JVM 的堆内（On-heap）空间进行了更为详细的分配，以充分利用内存。同时，Spark 引入了堆外（Off-heap）内存，使之可以直接在工作节点的系统内存中开辟空间，进一步优化了内存的使用。
 
-1）堆内内存：Executor 内运行的并发任务共享 JVM 堆内内存，这些任务在缓存 RDD 数据和广播（Broadcast）数据时占用的内存被规划为存储（Storage）内存，而这些任务在执行 Shuffle 时占用的内存被规划为执行（Execution）内存，剩余的部分不做特殊规划，那些 Spark 内部的对象实例，或者用户定义的 Spark 应用程序中的对象实例，均占用剩余的空间。不同的管理模式下，这三部分占用的空间大小各不相同（下面第 2 小节会进行介绍）。
+**一、堆内内存**
+
+堆内内存的大小，由 Spark 应用程序启动时的 –executor-memory 或 spark.executor.memory 参数配置。Executor 内运行的并发任务共享 JVM 堆内内存。
+
+- 存储（Storage）内存：任务在缓存 RDD 数据和广播（Broadcast）数据时占用的内存
+
+- 执行（Execution）内存：任务在执行 Shuffle 时占用的内存
+
+- 其他：剩余的部分不做特殊规划，那些 Spark 内部的对象实例，或者用户定义的 Spark 应用程序中的对象实例，均占用剩余的空间。
+
+不同的管理模式下，这三部分占用的空间大小各不相同。
+
+Spark 对堆内内存的管理是一种逻辑上的"规划式"的管理，因为对象实例占用内存的申请和释放都由 JVM 完成，Spark 只能在申请后和释放前**记录**这些内存，我们来看其具体流程：
+
+**申请内存**：
+
+1. Spark 在代码中 new 一个对象实例
+2. JVM 从堆内内存分配空间，创建对象并返回对象引用
+3. Spark 保存该对象的引用，记录该对象占用的内存
+
+**释放内存**：
+
+1. Spark 记录该对象释放的内存，删除该对象的引用
+2. 等待 JVM 的垃圾回收机制释放该对象占用的堆内内存
+
+**对象存储：**
 
 JVM 的对象可以以序列化的方式存储，序列化的过程是将对象转换为二进制字节流，本质上可以理解为将非连续空间的链式存储转化为连续空间或块存储，在访问时则需要进行序列化的逆过程——反序列化，将字节流转化为对象，序列化的方式可以节省存储空间，但增加了存储和读取时候的计算开销。
 
-对于 Spark 中序列化的对象，由于是字节流的形式，其占用的内存大小可直接计算，而对于非序列化的对象，其占用的内存是通过周期性地采样近似估算而得，即并不是每次新增的数据项都会计算一次占用的内存大小，这种方法降低了时间开销但是有可能误差较大，导致某一时刻的实际内存有可能远远超出预期[2]。此外，在被 Spark 标记为释放的对象实例，很有可能在实际上并没有被 JVM 回收，导致实际可用的内存小于 Spark 记录的可用内存。所以 Spark 并不能准确记录实际可用的堆内内存，从而也就无法完全避免内存溢出（OOM, Out of Memory）的异常。
+**OOM异常：**
+
+对于 Spark 中序列化的对象，由于是字节流的形式，其占用的内存大小可直接计算，而对于非序列化的对象，其占用的内存是通过周期性地采样近似估算而得，即并不是每次新增的数据项都会计算一次占用的内存大小，这种方法降低了时间开销但是有可能误差较大，导致某一时刻的实际内存有可能远远超出预期。此外，在被 Spark 标记为释放的对象实例，很有可能在实际上并没有被 JVM 回收，导致实际可用的内存小于 Spark 记录的可用内存。所以 Spark 并不能准确记录实际可用的堆内内存，从而也就无法完全避免内存溢出（OOM, Out of Memory）的异常。
 
 虽然不能精准控制堆内内存的申请和释放，但 Spark 通过对存储内存和执行内存各自独立的规划管理，可以决定是否要在存储内存里缓存新的 RDD，以及是否为新的任务分配执行内存，在一定程度上可以提升内存的利用率，减少异常的出现。
 
-1.2 堆外内存
+**二、堆外内存**
 
-为了进一步优化内存的使用以及提高 Shuffle 时排序的效率，Spark 引入了堆外（Off-heap）内存，使之可以直接在工作节点的系统内存中开辟空间，存储经过序列化的二进制数据。利用 JDK Unsafe API（从 Spark 2.0 开始，在管理堆外的存储内存时不再基于 Tachyon，而是与堆外的执行内存一样，基于 JDK Unsafe API 实现[3]），Spark 可以直接操作系统堆外内存，减少了不必要的内存开销，以及频繁的 GC 扫描和回收，提升了处理性能。堆外内存可以被精确地申请和释放，而且序列化的数据占用的空间可以被精确计算，所以相比堆内内存来说降低了管理的难度，也降低了误差。
+为了进一步优化内存的使用以及提高 Shuffle 时排序的效率，Spark 引入了堆外（Off-heap）内存，使之可以直接在工作节点的系统内存中开辟空间，存储经过序列化的二进制数据。利用 JDK Unsafe API（从 Spark 2.0 开始，在管理堆外的存储内存时不再基于 Tachyon，而是与堆外的执行内存一样，基于 JDK Unsafe API 实现）。除了没有 other 空间，堆外内存与堆内内存的划分方式相同，所有运行中的并发任务共享存储内存和执行内存。
 
-在默认情况下堆外内存并不启用，可通过配置 spark.memory.offHeap.enabled 参数启用，并由 spark.memory.offHeap.size 参数设定堆外空间的大小。除了没有 other 空间，堆外内存与堆内内存的划分方式相同，所有运行中的并发任务共享存储内存和执行内存。
+**优点：**
 
- 
+- 可以被精确地申请和释放，序列化的数据占用的空间可以被精确计算，所以相比堆内内存来说降低了管理的难度，也降低了误差。
+- 可以直接操作系统堆外内存，减少了不必要的内存开销，以及频繁的 GC 扫描和回收，提升了处理性能。
+
+**配置：**
+
+在默认情况下堆外内存并不启用
+
+- spark.memory.offHeap.enabled 参数启用
+- spark.memory.offHeap.size 参数设定堆外空间的大小
+
+**三、 内存空间分配**
 
 Spark 为存储内存和执行内存的管理提供了统一的接口——MemoryManager，同一个 Executor 内的任务都调用这个接口的方法来申请或释放内存:
 
 MemoryManager 的具体实现上，Spark 1.6 之后默认为统一管理（[Unified Memory Manager](https://github.com/apache/spark/blob/v2.1.0/core/src/main/scala/org/apache/spark/memory/UnifiedMemoryManager.scala)）方式，1.6 之前采用的静态管理（[Static Memory Manager](https://github.com/apache/spark/blob/v2.1.0/core/src/main/scala/org/apache/spark/memory/StaticMemoryManager.scala)）方式仍被保留，可通过配置 spark.memory.useLegacyMode 参数启用。两种方式的区别在于对空间分配的方式。
 
-2 . 内存空间分配
+1. **静态内存管理**
 
-2.1 静态内存管理
-
-在 Spark 最初采用的静态内存管理机制下，存储内存、执行内存和其他内存的大小在 Spark 应用程序运行期间均为固定的，但用户可以应用程序启动前进行配置，堆内内存的分配如图 2 所示：
-
- 
-
-来自 <<https://www.ibm.com/developerworks/cn/analytics/library/ba-cn-apache-spark-memory-management/index.html>>
-
- 
+在 Spark 最初采用的静态内存管理机制下，存储内存、执行内存和其他内存的大小在 Spark 应用程序运行期间均为固定的，但用户可以应用程序启动前进行配置，堆内内存的分配如图所示：
 
 <div align="center"> <img src="../pics/lip_image003.png" width="500"/> </div><br>
 
 其中 systemMaxMemory 取决于当前 JVM 堆内内存的大小，最后可用的执行内存或者存储内存要在此基础上与各自的 memoryFraction 参数和 safetyFraction 参数相乘得出。上述计算公式中的两个 safetyFraction 参数，其意义在于在逻辑上预留出 1-safetyFraction 这么一块保险区域，降低因实际内存超出当前预设范围而导致 OOM 的风险（上文提到，对于非序列化对象的内存采样估算会产生误差）。值得注意的是，这个预留的保险区域仅仅是一种逻辑上的规划，在具体使用时 Spark 并没有区别对待，和"其它内存"一样交给了 JVM 去管理。
 
-堆外的空间分配较为简单，只有存储内存和执行内存，如图 3 所示。可用的执行内存和存储内存占用的空间大小直接由参数 spark.memory.storageFraction 决定，由于堆外内存占用的空间可以被精确计算，所以无需再设定保险区域。
+<div align="center"> <img src="../pics/image003.png" width="500"/> </div><br>堆外的空间分配较为简单，只有存储内存和执行内存，如图所示。可用的执行内存和存储内存占用的空间大小直接由参数 spark.memory.storageFraction 决定，由于堆外内存占用的空间可以被精确计算，所以无需再设定保险区域。
 
- 
+堆外的空间分配较为简单，只有存储内存和执行内存。可用的执行内存和存储内存占用的空间大小直接由参数 spark.memory.storageFraction 决定，由于堆外内存占用的空间可以被精确计算，所以无需再设定保险区域。
 
-2.2 统一内存管理
+2. **统一内存管理**
 
-Spark 1.6 之后引入的统一内存管理机制，与静态内存管理的区别在于存储内存和执行内存共享同一块空间，可以动态占用对方的空闲区域，如图 4 和图 5 所示
+Spark 1.6 之后引入的统一内存管理机制，与静态内存管理的区别在于存储内存和执行内存共享同一块空间，可以动态占用对方的空闲区域。
 
  <div align="center"> <img src="../pics/lip_image004.png" width="500"/> </div><br>
+ <div align="center"> <img src="../pics/image005.png" width="500"/> </div><br>
 
 其中最重要的优化在于动态占用机制，其规则如下：
 
-- - 设定基本的存储内存和执行内存区域（spark.storage.storageFraction 参数），该设定确定了双方各自拥有的空间的范围
-  - 双方的空间都不足时，则存储到硬盘；若己方空间不足而对方空余时，可借用对方的空间;（存储空间不足是指不足以放下一个完整的 Block）
-  - 执行内存的空间被对方占用后，可让对方将占用的部分转存到硬盘，然后"归还"借用的空间
-  - 存储内存的空间被对方占用后，无法让对方"归还"，因为需要考虑 Shuffle 过程中的很多因素，实现起来较为复杂
+- 设定基本的存储内存和执行内存区域（spark.storage.storageFraction 参数），该设定确定了双方各自拥有的空间的范围
+- 双方的空间都不足时，则存储到硬盘；若己方空间不足而对方空余时，可借用对方的空间;（存储空间不足是指不足以放下一个完整的 Block）
+- 执行内存的空间被对方占用后，可让对方将占用的部分转存到硬盘，然后"归还"借用的空间
+- 存储内存的空间被对方占用后，无法让对方"归还"，因为需要考虑 Shuffle 过程中的很多因素，实现起来较为复杂
 
-凭借统一内存管理机制，Spark 在一定程度上提高了堆内和堆外内存资源的利用率，降低了开发者维护 Spark 内存的难度，但并不意味着开发者可以高枕无忧。譬如，所以如果存储内存的空间太大或者说缓存的数据过多，反而会导致频繁的全量垃圾回收，降低任务执行时的性能，因为缓存的 RDD 数据通常都是长期驻留内存的 [5] 。所以要想充分发挥 Spark 的性能，需要开发者进一步了解存储内存和执行内存各自的管理方式和实现原理。
+<div align="center"> <img src="../pics/image006.png" width="600"/> </div><br>
 
- 
+凭借统一内存管理机制，Spark 在一定程度上提高了堆内和堆外内存资源的利用率，降低了开发者维护 Spark 内存的难度，但并不意味着开发者可以高枕无忧。譬如，所以如果存储内存的空间太大或者说缓存的数据过多，反而会导致频繁的全量垃圾回收，降低任务执行时的性能，因为缓存的 RDD 数据通常都是长期驻留内存的。所以要想充分发挥 Spark 的性能，需要开发者进一步了解存储内存和执行内存各自的管理方式和实现原理。
 
- 
+**四、存储内存管理**
 
-Spark RDD持久化
+**1. Spark RDD持久化**
 
-RDD 的持久化由 Spark 的 Storage 模块 [7] 负责，实现了 RDD 与物理存储的解耦合。Storage 模块负责管理 Spark 在计算过程中产生的数据，将那些在内存或磁盘、在本地或远程存取数据的功能封装了起来。在具体实现时 Driver 端和 Executor 端的 Storage 模块构成了主从式的架构，即 Driver 端的 BlockManager 为 Master，Executor 端的 BlockManager 为 Slave。Storage 模块在逻辑上以 Block 为基本存储单位，RDD 的每个 Partition 经过处理后唯一对应一个 Block（BlockId 的格式为 rdd_RDD-ID_PARTITION-ID ）。
+RDD 的持久化由 Spark 的 Storage 模块负责，实现了 RDD 与物理存储的解耦合。Storage 模块负责管理 Spark 在计算过程中产生的数据，将那些在内存或磁盘、在本地或远程存取数据的功能封装了起来。
 
-在对 RDD 持久化时，Spark 规定了 MEMORY_ONLY、MEMORY_AND_DISK 等 7 种不同的 [存储级别 ](http://spark.apache.org/docs/latest/programming-guide.html#rdd-persistence)，而存储级别是以下 5 个变量的组合：
+- 在具体实现时， Driver 端和 Executor 端的 Storage 模块构成了主从式的架构，即 Driver 端的 BlockManager 为 Master，Executor 端的 BlockManager 为 Slave。Master 负责整个 Spark 应用程序的 Block 的元数据信息的管理和维护，而 Slave 需要将 Block 的更新等状态上报到 Master，同时接收 Master 的命令，例如新增或删除一个 RDD。
 
+- Storage 模块在逻辑上以 Block 为基本存储单位，RDD 的每个 Partition 经过处理后唯一对应一个 Block（BlockId 的格式为 rdd_RDD-ID_PARTITION-ID ）。
+
+  <div align="center"> <img src="../pics/image007.png" width="600"/> </div><br>
+
+- Spark 规定了 MEMORY_ONLY、MEMORY_AND_DISK 等 7 种不同的 [存储级别 ](http://spark.apache.org/docs/latest/programming-guide.html#rdd-persistence)，而存储级别是以下 5 个变量的组合：
+
+``` scala
 class StorageLevel private(
-
 private var _useDisk: Boolean, //磁盘
-
 private var _useMemory: Boolean, //这里其实是指堆内内存
-
 private var _useOffHeap: Boolean, //堆外内存
-
 private var _deserialized: Boolean, //是否为非序列化
-
 private var _replication: Int = 1 //副本个数
-
 )
+```
 
-RDD 在缓存到存储内存之后，Partition 被转换成 Block，Record 在堆内或堆外存储内存中占用一块连续的空间。将Partition由不连续的存储空间转换为连续存储空间的过程，Spark称之为"展开"（Unroll）。Block 有序列化和非序列化两种存储格式，具体以哪种方式取决于该 RDD 的存储级别。每个 Executor 的 Storage 模块用一个链式 Map 结构（LinkedHashMap）来管理堆内和堆外存储内存中所有的 Block 对象的实例[6]。因为不能保证存储空间可以一次容纳 Iterator 中的所有数据，当前的计算任务在 Unroll 时要向 MemoryManager 申请足够的 Unroll 空间来临时占位，空间不足则 Unroll 失败，空间足够时可以继续进行。
+​	通过对数据结构的分析，可以看出存储级别从三个维度定义了 RDD 的 Partition（同时也就是 Block）的存储方式：
+
+1. 存储位置：磁盘／堆内内存／堆外内存。如 MEMORY_AND_DISK 是同时在磁盘和堆内内存上存储，实现了冗余备份。OFF_HEAP 则是只在堆外内存存储，目前选择堆外内存时不能同时存储到其他位置。
+
+2. 存储形式：Block 缓存到存储内存后，是否为非序列化的形式。如 MEMORY_ONLY 是非序列化方式存储，OFF_HEAP 是序列化方式存储。
+3. 副本数量：大于 1 时需要远程冗余备份到其他节点。如 DISK_ONLY_2 需要远程备份 1 个副本。
+
+**2 . RDD 缓存的过程**
+
+RDD 在缓存到存储内存之前，Partition 中的数据一般以迭代器（[Iterator](http://www.scala-lang.org/docu/files/collections-api/collections_43.html)）的数据结构来访问，这是 Scala 语言中一种遍历数据集合的方法。通过 Iterator 可以获取分区中每一条序列化或者非序列化的数据项(Record)，这些 Record 的对象实例在逻辑上占用了 JVM 堆内内存的 other 部分的空间，同一 Partition 的不同 Record 的空间并不连续。
+
+RDD 在缓存到存储内存之后，Partition 被转换成 Block，Record 在堆内或堆外存储内存中占用一块连续的空间。将Partition由不连续的存储空间转换为连续存储空间的过程，Spark称之为"展开"（Unroll）。Block 有序列化和非序列化两种存储格式，具体以哪种方式取决于该 RDD 的存储级别。每个 Executor 的 Storage 模块用一个链式 Map 结构（LinkedHashMap）来管理堆内和堆外存储内存中所有的 Block 对象的实例。因为不能保证存储空间可以一次容纳 Iterator 中的所有数据，当前的计算任务在 Unroll 时要向 MemoryManager 申请足够的 Unroll 空间来临时占位，空间不足则 Unroll 失败，空间足够时可以继续进行。
+
+- 对于序列化的 Partition，其所需的 Unroll 空间可以直接累加计算，一次申请。
+
+- 非序列化的 Partition 则要在遍历 Record 的过程中依次申请，即每读取一条 Record，采样估算其所需的 Unroll 空间并进行申请，空间不足时可以中断，释放已占用的 Unroll 空间。如果最终 Unroll 成功，当前 Partition 所占用的 Unroll 空间被转换为正常的缓存 RDD 的存储空间。
+
+  <div align="center"> <img src="../pics/image008.png" width="500"/> </div><br>
+
+​    在静态内存管理时，Spark 在存储内存中专门划分了一块 Unroll 空间，其大小是固定的，统一内存管理时则没有对 Unroll 空间进行特别区分，当存储空间不足时会根据动态占用机制进行处理。
+
+**3.  淘汰和落盘**
 
 由于同一个 Executor 的所有的计算任务共享有限的存储内存空间，当有新的 Block 需要缓存但是剩余空间不足且无法动态占用时，就要对 LinkedHashMap 中的旧 Block 进行淘汰（Eviction），而被淘汰的 Block 如果其存储级别中同时包含存储到磁盘的要求，则要对其进行落盘（Drop），否则直接删除该 Block。
 
- 
+存储内存的淘汰规则为：
 
-来自 <<https://www.ibm.com/developerworks/cn/analytics/library/ba-cn-apache-spark-memory-management/index.html>>
+- 被淘汰的旧 Block 要与新 Block 的 MemoryMode 相同，即同属于堆外或堆内内存
+- 新旧 Block 不能属于同一个 RDD，避免循环淘汰
+- 旧 Block 所属 RDD 不能处于被读状态，避免引发一致性问题
+- 遍历 LinkedHashMap 中 Block，按照最近最少使用（LRU）的顺序淘汰，直到满足新 Block 所需的空间。其中 LRU 是 LinkedHashMap 的特性。
 
- 
+落盘的流程则比较简单，如果其存储级别符合useDisk 为 true 的条件，再根据其deserialized 判断是否是非序列化的形式，若是则对其进行序列化，最后将数据存储到磁盘，在 Storage 模块中更新其信息。
 
-Spark Shuffle持久化
+**五、 执行内存管理**
+
+1. **多任务间内存分配**
+
+Executor 内运行的任务同样共享执行内存，Spark 用一个 HashMap 结构保存了任务到内存耗费的映射。每个任务可占用的执行内存大小的范围为 1/2N ~ 1/N，其中 N 为当前 Executor 内正在运行的任务的个数。每个任务在启动之时，要向 MemoryManager 请求申请最少为 1/2N 的执行内存，如果不能被满足要求则该任务被阻塞，直到有其他任务释放了足够的执行内存，该任务才可以被唤醒。
+
+2. **Shuffle 的内存占用**
+
+执行内存主要用来存储任务在执行 Shuffle 时占用的内存，Shuffle 是按照一定规则对 RDD 数据重新分区的过程，我们来看 Shuffle 的 Write 和 Read 两阶段对执行内存的使用：
+
+- Shuffle Write
+
+1. 若在 map 端选择普通的排序方式，会采用 ExternalSorter 进行外排，在内存中存储数据时主要占用**堆内**执行空间。
+2. 若在 map 端选择 Tungsten 的排序方式，则采用 ShuffleExternalSorter 直接对以**序列化**形式存储的数据排序，在内存中存储数据时可以占用**堆外或堆内**执行空间，取决于用户是否开启了堆外内存以及堆外执行内存是否足够。
+
+- Shuffle Read
+
+1. 在对 reduce 端的数据进行聚合时，要将数据交给 Aggregator 处理，在内存中存储数据时占用堆内执行空间。
+2. 如果需要进行最终结果排序，则要将再次将数据交给 ExternalSorter 处理，占用堆内执行空间。
+
+在 ExternalSorter 和 Aggregator 中，Spark 会使用一种叫 **AppendOnlyMap** 的哈希表在堆内执行内存中存储数据，但在 Shuffle 过程中所有数据并不能都保存到该哈希表中，对这个哈希表占用的内存会进行周期性地采样估算，当其大到一定程度，无法再从 MemoryManager 申请到新的执行内存时，Spark 就会将其全部内容存储到磁盘文件中，这个过程被称为溢存(Spill)，溢存到磁盘的文件最后会被归并(Merge)。
+
+Shuffle Write 阶段中用到的 Tungsten 是 Databricks 公司提出的对 Spark 优化内存和 CPU 使用的计划，解决了一些 JVM 在性能上的限制和弊端。Spark 会根据 Shuffle 的情况来自动选择是否采用 Tungsten 排序。Tungsten 采用的页式内存管理机制建立在 MemoryManager 之上，即 Tungsten 对执行内存的使用进行了一步的抽象，这样在 Shuffle 过程中无需关心数据具体存储在堆内还是堆外。每个内存页用一个 MemoryBlock 来定义，并用 Object obj 和 long offset 这两个变量统一标识一个内存页在系统内存中的地址。堆内的 MemoryBlock 是以 long 型数组的形式分配的内存，其 obj 的值为是这个数组的对象引用，offset 是 long 型数组的在 JVM 中的初始偏移地址，两者配合使用可以定位这个数组在堆内的绝对地址；堆外的 MemoryBlock 是直接申请到的内存块，其 obj 为 null，offset 是这个内存块在系统内存中的 64 位绝对地址。Spark 用 MemoryBlock 巧妙地将堆内和堆外内存页统一抽象封装，并用页表(pageTable)管理每个 Task 申请到的内存页。
+
+Tungsten 页式管理下的所有内存用 64 位的逻辑地址表示，由页号和页内偏移量组成：
+
+- 页号：占 13 位，唯一标识一个内存页，Spark 在申请内存页之前要先申请空闲页号。
+- 页内偏移量：占 51 位，是在使用内存页存储数据时，数据在页内的偏移地址。
+
+有了统一的寻址方式，Spark 可以用 64 位逻辑地址的指针定位到堆内或堆外的内存，整个 Shuffle Write 排序的过程只需要对指针进行排序，并且无需反序列化，整个过程非常高效，对于内存访问效率和 CPU 使用效率带来了明显的提升。
+
+**Spark Shuffle持久化**
 
 与RDD持久化不同，shuffle持久化必须在磁盘。shuffle持久化有两种方式：一种是将shuffle数据块映射成文件，另一种是将数据块映射为文件的一段，将分时运行的map任务产生的shuffle数据块合并到一个文件中。这与shuffle的方式有关。
 
- 
+Spark 的存储内存和执行内存有着截然不同的管理方式：对于存储内存来说，Spark 用一个 LinkedHashMap 来集中管理所有的 Block，Block 由需要缓存的 RDD 的 Partition 转化而成；而对于执行内存，Spark 用 AppendOnlyMap 来存储 Shuffle 过程中的数据，在 Tungsten 排序中甚至抽象成为页式内存管理，开辟了全新的 JVM 内存管理机制。
 
-Spark Shuffle过程
+**参考链接：**
 
-Shuffle的中文解释为“洗牌操作”，可以理解成将集群中所有节点上的数据进行重新整合分类的过程。Spark shuffle有三种方式：hashShuffle（后期优化有consolidate shuffle）、sort shuffler和tungsten-sort shuffle。Spark1.1之前是HashShuffle默认的分区器是HashPartitioner，Spark1.1引入SortShuffle，默认的分区器是RangePartitioner。
+- [Apache Spark 内存管理详解](https://www.ibm.com/developerworks/cn/analytics/library/ba-cn-apache-spark-memory-management/index.html) 
 
-<https://imcoder.site/article.do?method=detail&aid=168>
+## Spark Shuffle过程
 
-Hash Shuffler：适合小数据量
+Shuffle的中文解释为“洗牌操作”，可以理解成将集群中所有节点上的数据进行重新整合分类的过程。Spark shuffle有三种方式：hashShuffle（后期优化有consolidate shuffle）、sort shuffle和tungsten-sort shuffle。Spark1.1之前是HashShuffle默认的分区器是HashPartitioner，Spark1.1引入SortShuffle，默认的分区器是RangePartitioner。
 
-每一个map task将 不同结果写到不同的buffer 中，每个buffer的大小为 32K 。buffer起到数据缓存的作用。 Map task会根据 分区器（默认是hashPartitioner）算出当前key需写入的 partition，然后经过对应的缓存写入单独的文件，所以 buffer缓存的个数即小文件的个数由 下一个Stage的并行度（ ReduceTask个数）决定，使得 每一个task 产生 R个文件 （ReduceTask个数）。
+https://imcoder.site/article.do?method=detail&aid=168
+### Shuffle 分类
+#### Hash Shuffle
 
-如果有 m个MapTask ，则 有 M*R 个小文件。然后Reduce Task来拉取对应的磁盘小文件。
+**使用场景：**适合小数据量
 
-<div align="center"> <img src="../pics/lip_image005.png" width="500"/> </div><br>
+**过程：**每一个map task将不同结果写到不同的buffer中，每个buffer的大小为32K。buffer起到数据缓存的作用。 Map task会根据分区器(默认是hashPartitioner)算出当前key需写入的 partition，然后经过对应的缓存写入单独的文件，所以 buffer缓存的个数即小文件的个数，由下一个Stage的并行度(ReduceTask个数)决定，使得每一个task 产生R个文件(ReduceTask个数)。如果有m个map task，则有M*R个小文件。然后reduce task来拉取对应的磁盘小文件。
 
- 
-
-开启：
-
- 
-
-​        spark.shuffle.manager=hash
+<div align="center"> <img src="../pics/lip_image005.png" width="600"/> </div><br>
 
  
 
-产生的磁盘小文件过多，会导致以下问题：
+**开启：**spark.shuffle.manager=hash 
 
- 
+**缺点：**产生的磁盘小文件过多，会导致以下问题：
 
-​        a)        在Shuffle Write过程中会产生很多写磁盘小文件的对象。
+- 在Shuffle Write过程中会产生很多写磁盘小文件的对象 
+-  在Shuffle Read过程中会产生很多读取磁盘小文件的对象
+- 在JVM堆内存中对象过多会造成频繁的GC，GC还无法解决运行所需要的内存的话，就会OOM
+- 在数据传输过程中会有频繁的网络通信，频繁的网络通信出现通信故障的可能性大大增加，一旦网络通信出现了故障会导致shuffle file cannot find。由于这个错误导致的task失败，TaskScheduler不负责重试，由DAGScheduler负责重试Stage。
 
- 
+#### Hash Shuffle Consolidate：
 
-​        b)        在Shuffle Read过程中会产生很多读取磁盘小文件的对象。
+**使用场景：**Spark在引入Sort-Based Shuffle之前，适合中小型数据规模的大数据处理！ 
 
- 
-
-​        c)        在JVM堆内存中对象过多会造成频繁的gc,gc还无法解决运行所需要的内存 的话，就会OOM。
-
- 
-
- 
-
-​        d)        在数据传输过程中会有频繁的网络通信，频繁的网络通信出现通信故障的可能性大大增加，一旦网络通信出现了故障会导致shuffle file cannot find 由于这个错误导致的task失败，TaskScheduler不负责重试，由DAGScheduler负责重试Stage。
-
- 
-
-HashShuffler Consolidate合并机制：
+**过程：**每个 Executor 里的map task 共用 一个buffer写缓存。也就是一个Excutor才有 R个小文件。所有小文件数量会减少到C*R个(C指在Mapper端能够使用的Core数，有多少个Core就可以设置多少个Executor)
 
 <div align="center"> <img src="../pics/lip_image006.png" width="500"/> </div><br>
 
-每个 Executor 里的 MapTask 共用 一个Buffer写缓存 。也就是 一个Excutor 才有 R个小文件 。所有小文件数量会减少到 C*R  个 （C指 在Mapper端能够使用的Core数 ，有多少个Core就可以设置多少个Executor）
+**开启方法：** spark.shuffle.consolidateFiles=true
 
-开启方法： spark.shuffle.consolidateFiles=true
+**优点：**Consolidate并没有降低并行度，只是降低了临时文件的数量，此时Mapper端的内存消耗就会变少，所以OOM也就会降低，另外一方面磁盘的性能也会变得更好
 
-如果Reducer端的并行数据分片过多的话则C*R可能已经过大，此时依旧没有逃脱文件打开过多的厄运！！！Consolidate并没有降低并行度，只是降低了临时文件的数量，此时Mapper端的内存消耗就会变少，所以OOM也就会降低，另外一方面磁盘的性能也会变得更好。 
+**缺点：**如果Reducer端的并行数据分片过多的话则C*R可能已经过大，此时依旧没有逃脱文件打开过多的厄运
 
-Spark在引入Sort-Based Shuffle之前，适合中小型数据规模的大数据处理！ 
+#### Sort-based Shuffle
 
- 
-
-Sort Shuffler：SortShuffleManager 适合大数据量
+**使用场景：**适合大数据量
 
 来自 <<https://blog.csdn.net/snail_gesture/article/details/50807129>>
 
-1) 首先每个ShuffleMapTask不会为每个Reducer单独生成一个文件，相反，Sort-based Shuffle会把Mapper中每个ShuffleMapTask所有的输出数据Data只写到一个文件中。因为每个ShuffleMapTask中的数据会被分类，所以Sort-based Shuffle使用了index文件存储具体ShuffleMapTask输出数据在同一个Data文件中是如何分类的信息！！ 
+**过程：**
 
-2) 基于Sort-base的Shuffle会在Mapper中的每一个ShuffleMapTask中产生两个文件：Data文件和Index文件，其中Data文件是存储当前Task的Shuffle输出的。而index文件中则存储了Data文件中的数据通过Partitioner的分类信息，此时下一个阶段的Stage中的Task就是根据这个Index文件获取自己所要抓取的上一个Stage中的ShuffleMapTask产生的数据的，Reducer就是根据index文件来获取属于自己的数据。 
+1. MapTask处理 Partition 里的数据时，会向一个大小为5M的内存数据结构里写数据。
 
-涉及问题：Sorted-based Shuffle：会产生 2*M(M代表了Mapper阶段中并行的Partition的总数量，其实就是ShuffleMapTask的总数量)个Shuffle临时文件。 
+2. 每插入32次数据，就会检查一次内存大小，如果内存大小 size超过5M就会申请（size\*2 - 5）M 的空间，如果申请成功不会进行溢写，如果申请不成功，这时候会发生溢写磁盘。
 
-Shuffle产生的临时文件的数量的变化一次为： 
+3. 溢写会先排序与分区，再以每个batch为1万条数据溢写到32k的内存缓存区，然后再溢写到磁盘（产生大量磁盘小文件）。
 
-Basic Hash Shuffle: M*R; 
+4. MapTask结束后，会将将这些小文件合并成一个大文件和一个索引文件 。
 
-Consalidate方式的Hash Shuffle: C*R; 
+5. ReduceTask 从MapTask拉取数据时（最大可以拉取48M），首先解析索引文件，根据索引文件再去拉取对应的数据。
 
-Sort-based Shuffle: 2*M; 
+6. 后会将这些文件放到 Executor 的shuffle聚合内存(为Executor内存的20%)聚合。
 
- 
+7. 所以SortShuffler会产生2\*M个文件（2为一个大文件一个索引文件，M为MapTask个数）
 
-默认Sort-based Shuffle的几个缺陷： 
+   <div align="center"> <img src="../pics/lip_image007.png" width="500"/> </div><br> 
 
-\1. 如果Mapper中Task的数量过大，依旧会产生很多小文件，此时在Shuffle传递数据的过程中到Reducer端，reduce会需要同时打开大量的记录来进行反序列化，导致大量的内存消耗和GC的巨大负担，造成系统缓慢甚至崩溃！ 
+每个ShuffleMapTask不会为每个Reducer单独生成一个文件，相反，Sort-based Shuffle会把Mapper中每个ShuffleMapTask所有的输出数据Data只写到一个文件中。基于Sort-base的Shuffle会在Mapper中的每一个ShuffleMapTask中产生两个文件：Data文件和Index文件，其中Data文件是存储当前Task的Shuffle输出的。而index文件中则存储了Data文件中的数据通过Partitioner的分类信息，此时下一个阶段的Stage中的Task就是根据这个Index文件获取自己所要抓取的上一个Stage中的ShuffleMapTask产生的数据的，Reducer就是根据index文件来获取属于自己的数据。 
 
-2．如果需要在分片内也进行排序的话，此时需要进行Mapper端和Reducer端的两次排序！！！ 
+**开启:** spark.shuffle.manager=sort    sort为1.6默认
 
-优化： 
+**缺点：** 
 
-可以改造Mapper和Reducer端，改框架来实现一次排序。 
+- 如果Mapper中Task的数量过大，依旧会产生很多小文件，此时在Shuffle传递数据的过程中到Reducer端，reduce会需要同时打开大量的记录来进行反序列化，导致大量的内存消耗和GC的巨大负担，造成系统缓慢甚至崩溃
+- 如果需要在分片内也进行排序的话，此时需要进行Mapper端和Reducer端的两次排序
 
-频繁GC的解决办法是：钨丝计划！！ 
+**优化：** 可以改造Mapper和Reducer端，改框架来实现一次排序。 频繁GC的解决办法是：钨丝计划！！ 
 
- 
-
-MapTask 处理 Partition 里的数据时，会向一个大小为 5M 的 内存数据结构  里写数据。
-
-​        每 插入32次 数据，就会 检查一次  内存大小，如果内存大小 size 超过 5M  就会申请  （size*2 - 5）M  的空间，如果申请成功不会进行溢写，如果申请不成功，这时候会发生溢写磁盘。
-
-​        溢写会先 排序 与 分区，再以每个 batch 为 1万条  数据溢写到 32k 的内存缓存区，然后再溢写到磁盘（产生大量磁盘小文件）。
-
-​        MapTask结束后，会将将这些 小文件 合并  成 一个大文件  和 一个索引文件 。
-
-<div align="center"> <img src="../pics/lip_image007.png" width="500"/> </div><br> 
-
-​        ReduceTask 从MapTask拉取数据时（最大  可以拉取 48M），首先解析索引文件，根据索引文件再去拉取对应的数据。
-
-​        后会将这些文件放到 Executor 的 shuffle聚合内存（为Executor内存的 20%）聚合。
-
-​        所以所以SortShuffler会产生 2*M 个文件  （2为 一个大文件一个索引文件 ，M为 MapTask个数  ）
-
-开启：
-
-​        spark.shuffle.manager=sort    sort为1.6默认
-
-bypass运行机制
+**bypass运行机制**：当数据量比较小，或者不需要要对数据进行排序，这时SortShuffler中的排序就没用了。
 
 <div align="center"> <img src="../pics/lip_image008.png" width="500"/> </div><br>
 
-​        当数据量比较小，或者 不需要要对数据进行排序，这是SortShuffler中的排序就没有用了。
+触发不进行排序的条件：
 
-​        触发 不进行排序 的条件：
+- 当 shuffle ReduceTask 的个数小于参数值时，spark.shuffle.sort.bypassMergeThreshold 默认值 200。
 
-​                 · 当 shuffle ReduceTask 的个数 小于  参数值时，spark.shuffle.sort.bypassMergeThreshold 默认值 200。
+- 不是聚合类shuffle算子时
 
-​                 · 不是  聚合类shuffle算子时
-
-Tungsten-sort shuffle:
+#### Tungsten-sort shuffle
 
 <https://www.jianshu.com/p/d328c96aebfd>
 
-Tungsten-sort优化点主要在三个方面:
+**使用条件：**当且仅当下面条件都满足时，才会使用新的Shuffle方式：
 
-- 1. 直接在serialized binary data上sort而不是java objects，减少了memory的开销和GC的overhead。
-  2. 提供cache-efficient sorter，使用一个8bytes的指针，把排序转化成了一个指针数组的排序。
-  3. spill的merge过程也无需反序列化即可完成
+- Shuffle dependency 不能带有aggregation 或者输出需要排序
+- Shuffle 的序列化器需要是KryoSerializer或者Spark SQL自定义的一些序列化方式.
+- Shuffle 文件的数量不能大于 16777216
+- 序列化时，单条记录不能大于 128 MB
 
-这些优化的实现导致引入了一个新的内存管理模型，类似OS的Page，对应的实际数据结构为MemoryBlock,支持off-heap 以及 in-heap 两种模式。为了能够对Record 在这些MemoryBlock进行定位，引入了Pointer（指针）的概念。
+**开启：**Spark 默认开启的是Sort Based Shuffle，想要打开Tungsten-sort，请设置spark.shuffle.manager=tungsten-sort
 
-如果你还记得Sort Based Shuffle里存储数据的对象PartitionedAppendOnlyMap,这是一个放在JVM heap里普通对象，在Tungsten-sort中，他被替换成了类似操作系统内存页的对象。如果你无法申请到新的Page,这个时候就要执行spill操作，也就是写入到磁盘的操作。具体触发条件，和Sort Based Shuffle 也是类似的。
+**优点：**主要在三个方面:
 
-当且仅当下面条件都满足时，才会使用新的Shuffle方式：
+- 直接在serialized binary data上sort而不是java objects，减少了memory的开销和GC的overhead。
+- 提供cache-efficient sorter，使用一个8 bytes的指针，把排序转化成了一个指针数组的排序。
+- spill的merge过程也无需反序列化即可完成
 
-- - Shuffle dependency 不能带有aggregation 或者输出需要排序
-  - Shuffle 的序列化器需要是 KryoSerializer 或者 Spark SQL's 自定义的一些序列化方式.
-  - Shuffle 文件的数量不能大于 16777216
-  - 序列化时，单条记录不能大于 128 MB
+**实现：**引入了一个新的内存管理模型，类似OS的Page，对应的实际数据结构为MemoryBlock，支持off-heap 以及 in-heap 两种模式。为了能够对Record 在这些MemoryBlock进行定位，引入了Pointer(指针)的概念。
 
-可以看到，能使用的条件还是挺苛刻的。
+Sort Based Shuffle里存储数据的对象PartitionedAppendOnlyMap是一个放在JVM heap里普通对象，在Tungsten-sort中，被替换成了类似操作系统内存页的对象。如果你无法申请到新的Page，这个时候就要执行spill操作，也就是写入到磁盘的操作。
 
 <div align="center"> <img src="../pics/lip_image009.png" width="500"/> </div><br> 
 
 这张图其实画的是 on-heap 的内存逻辑图，其中 #Page 部分为13bit, Offset 为51bit,你会发现 2^51 >>128M的。但是在Shuffle的过程中，对51bit 做了压缩，使用了27bit,具体如下：
 
- [24 bit partition number][13 bit memory page number][27 bit offset in page]
+ \[24 bit partition number\]\[13 bit memory page number\]\[27 bit offset in page\]
 
 这里预留出的24bit给了partition number,为了后面的排序用。上面的好几个限制其实都是因为这个指针引起的：
 
-- 1. 一个是partition 的限制，前面的数字 16777216 就是来源于partition number 使用24bit 表示的。
-  2. 第二个是page number
-  3. 第三个是偏移量，最大能表示到2^27=128M。那一个task 能管理到的内存是受限于这个指针的，最多是 2^13 * 128M 也就是1TB左右。
+- 一个是partition 的限制，前面的数字 16777216 就是来源于partition number 使用24bit 表示的。
+- 第二个是page number
+- 第三个是偏移量，最大能表示到2^27=128M。那一个task 能管理到的内存是受限于这个指针的，最多是 2^13 * 128M 也就是1TB左右。
 
 有了这个指针，我们就可以定位和管理到off-heap 或者 on-heap里的内存了。这个模型还是很漂亮的，内存管理也非常高效，记得之前的预估PartitionedAppendOnlyMap的内存是非常困难的，但是通过现在的内存管理机制，是非常快速并且精确的。
 
@@ -375,25 +424,18 @@ Tungsten-sort优化点主要在三个方面:
 
 同时，因为整个过程是追求不反序列化的，所以不能做aggregation。
 
- 
 
- 
+### Spark hashPartitioner和rangePartitioner的实现
 
-Spark hashPartitioner和rangePartitioner的实现
+- hashPartitioner分区：对于给定的key计算其hashCode，对分区数除余，得到key所属分区的id。可能导致分区中的数据量不均匀。
 
-hashPartitioner分区：对于给定的key计算其hashCode,对分区数除余，得到key所属分区的id。
+- RangePartitioner分区：尽量保证每个分区中的数据量均匀，而且分区和分区之间是有序的，但是分区内部元素不一定有序。总的来说RangePartitioner就是将一定范围内的数据映射到某个分区中。使用蓄水池抽样算法从RDD中抽取样本，对样本排序，计算出每个分区的最大key值，形成一个范围区间，判断key在区间内所处的范围，给出对应的分区id。该分区器要求key类型必须是可以排序的。
 
-问题：可能导致分区中的数据量不均匀。
-
-RangePartitioner分区：尽量保证每个分区中的数据量均匀，而且分区和分区之间是有序的，但是分区内部元素不一定有序。总的来说RangePartitioner就是将一定范围内的数据映射到某个分区中。使用蓄水池抽样算法从RDD中抽取样本，对样本排序，计算出每个分区的最大key值，形成一个范围区间，判断key在区间内所处的范围，给出对应的分区id。该分区器要求key类型必须是可以排序的。
-
- 
-
-map端计算结果缓存处理并简述appendOnlyMap和 ExternalAppendOnlyMap
+### map端计算结果缓存处理并简述appendOnlyMap和 ExternalAppendOnlyMap
 
 HashMap 是 Spark shuffle read 过程中频繁使用的、用于 aggregate 的数据结构。Spark 设计了两种：一种是全内存的 AppendOnlyMap，另一种是内存＋磁盘的 ExternalAppendOnlyMap。下面我们来分析一下两者特性及内存使用情况。
 
-\1. AppendOnlyMap
+#### AppendOnlyMap
 
 AppendOnlyMap 的官方介绍是 A simple open hash table optimized for the append-only use case, where keys are never removed, but the value for each key may be changed。意思是类似 HashMap，但没有remove(key)方法。其实现原理很简单，开一个大 Object 数组，蓝色部分存储 Key，白色部分存储 Value。如下图：
 
@@ -407,7 +449,7 @@ AppendOnlyMap 的官方介绍是 A simple open hash table optimized for the appe
 
 AppendOnlyMap 还有一个 destructiveSortedIterator(): Iterator[(K, V)] 方法，可以返回 Array 中排序后的 (K, V) pairs。实现方法很简单：先将所有 (K, V) pairs compact 到 Array 的前端，并使得每个 (K, V) 占一个位置（原来占两个），之后直接调用 Array.sort() 排序，不过这样做会破坏数组（key 的位置变化了）。
 
-\2. ExternalAppendOnlyMap
+#### ExternalAppendOnlyMap
 
 <div align="center"> <img src="../pics/lip_image011.png" width="500"/> </div><br>
 
@@ -419,15 +461,15 @@ ExternalAppendOnlyMap 持有一个 AppendOnlyMap，shuffle 来的一个个 (K, V
 
 整个 insert-merge-aggregate 的过程有三点需要进一步探讨一下：
 
-- - 内存剩余空间检测
+- 内存剩余空间检测
 
 与 Hadoop MapReduce 规定 reducer 中 70% 的空间可用于 shuffle-sort 类似，Spark 也规定 executor 中 spark.shuffle.memoryFraction * spark.shuffle.safetyFraction 的空间（默认是0.3 * 0.8）可用于 ExternalOnlyAppendMap。Spark 略保守是不是？更保守的是这 24％ 的空间不是完全用于一个 ExternalOnlyAppendMap 的，而是由在 executor 上同时运行的所有 reducer 共享的。为此，exectuor 专门持有一个 ShuffleMemroyMap: HashMap[threadId, occupiedMemory] 来监控每个 reducer 中 ExternalOnlyAppendMap 占用的内存量。每当 AppendOnlyMap 要扩展时，都会计算 ShuffleMemroyMap 持有的所有 reducer 中的 AppendOnlyMap 已占用的内存 ＋ 扩展后的内存 是会否会大于内存限制，大于就会将 AppendOnlyMap spill 到磁盘。有一点需要注意的是前 1000 个 records 进入 AppendOnlyMap 的时候不会启动是否要 spill 的检查，需要扩展时就直接在内存中扩展。
 
-- - AppendOnlyMap 大小估计
+- AppendOnlyMap 大小估计
 
 为了获知 AppendOnlyMap 占用的内存空间，可以在每次扩展时都将 AppendOnlyMap reference 的所有 objects 大小都算一遍，然后加和，但这样做非常耗时。所以 Spark 设计了粗略的估算算法，算法时间复杂度是 O(1)，核心思想是利用 AppendOnlyMap 中每次 insert-aggregate record 后 result 的大小变化及一共 insert 的 records 的个数来估算大小，具体见 SizeTrackingAppendOnlyMap 和 SizeEstimator。
 
-- - Spill 过程
+- Spill 过程
 
 与 shuffle write 一样，在 spill records 到磁盘上的时候，会建立一个 buffer 缓冲区，大小仍为 spark.shuffle.file.buffer.kb ，默认是 32KB。另外，由于 serializer 也会分配缓冲区用于序列化和反序列化，所以如果一次 serialize 的 records 过多的话缓冲区会变得很大。Spark 限制每次 serialize 的 records 个数为 spark.shuffle.spill.batchSize，默认是 10000。
 
@@ -577,6 +619,8 @@ Spark reduce OOM解决办法
 从 low-level 的角度来看，两者差别不小。 Hadoop MapReduce 是 sort-based，进入 combine() 和 reduce() 的 records 必须先 sort。这样的好处在于 combine/reduce() 可以处理大规模的数据，因为其输入数据可以通过外排得到（mapper 对每段数据先做排序，reducer 的 shuffle 对排好序的每段数据做归并）。目前的 Spark 默认选择的是 hash-based，通常使用 HashMap 来对 shuffle 来的数据进行 aggregate，不会对数据进行提前排序。如果用户需要经过排序的数据，那么需要自己调用类似 sortByKey() 的操作；如果你是Spark 1.1的用户，可以将spark.shuffle.manager设置为sort，则会对数据进行排序。在Spark 1.2中，sort将作为默认的Shuffle实现。
 
 从实现角度来看，两者也有不少差别。 Hadoop MapReduce 将处理流程划分出明显的几个阶段：map(), spill, merge, shuffle, sort, reduce() 等。每个阶段各司其职，可以按照过程式的编程思想来逐一实现每个阶段的功能。在 Spark 中，没有这样功能明确的阶段，只有不同的 stage 和一系列的 transformation()，所以 spill, merge, aggregate 等操作需要蕴含在 transformation() 中。
+
+
 
 Spark中repartition与coalesce的区别
 
