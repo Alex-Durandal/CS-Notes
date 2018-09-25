@@ -429,130 +429,61 @@ Sort Based Shuffle里存储数据的对象PartitionedAppendOnlyMap是一个放�
 
 - hashPartitioner分区：对于给定的key计算其hashCode，对分区数除余，得到key所属分区的id。可能导致分区中的数据量不均匀。
 
-- RangePartitioner分区：尽量保证每个分区中的数据量均匀，而且分区和分区之间是有序的，但是分区内部元素不一定有序。总的来说RangePartitioner就是将一定范围内的数据映射到某个分区中。使用蓄水池抽样算法从RDD中抽取样本，对样本排序，计算出每个分区的最大key值，形成一个范围区间，判断key在区间内所处的范围，给出对应的分区id。该分区器要求key类型必须是可以排序的。
+- RangePartitioner分区：尽量保证每个分区中的数据量均匀，而且分区和分区之间是有序的，但是分区内部元素不一定有序。总的来说RangePartitioner就是将一定范围内的数据映射到某个分区中。使用**蓄水池抽样**算法从RDD中抽取样本，对样本排序，计算出每个分区的最大key值，形成一个范围区间，判断key在区间内所处的范围，给出对应的分区id。该分区器要求key类型必须是可以排序的。
 
-### map端计算结果缓存处理并简述appendOnlyMap和 ExternalAppendOnlyMap
-
-HashMap 是 Spark shuffle read 过程中频繁使用的、用于 aggregate 的数据结构。Spark 设计了两种：一种是全内存的 AppendOnlyMap，另一种是内存＋磁盘的 ExternalAppendOnlyMap。下面我们来分析一下两者特性及内存使用情况。
-
-#### AppendOnlyMap
-
-AppendOnlyMap 的官方介绍是 A simple open hash table optimized for the append-only use case, where keys are never removed, but the value for each key may be changed。意思是类似 HashMap，但没有remove(key)方法。其实现原理很简单，开一个大 Object 数组，蓝色部分存储 Key，白色部分存储 Value。如下图：
-
-<div align="center"> <img src="../pics/lip_image010.png" width="500"/> </div><br>
-
-当要 put(K, V) 时，先 hash(K) 找存放位置，如果存放位置已经被占用，就使用 Quadratic probing 探测方法来找下一个空闲位置。对于图中的 K6 来说，第三次查找找到 K4 后面的空闲位置，放进去即可。get(K6) 的时候类似，找三次找到 K6，取出紧挨着的 V6，与先来的 value 做 func，结果重新放到 V6 的位置。
-
-迭代 AppendOnlyMap 中的元素的时候，从前到后扫描输出。
-
-如果 Array 的利用率达到 70%，那么就扩张一倍，并对所有 key 进行 rehash 后，重新排列每个 key 的位置。
-
-AppendOnlyMap 还有一个 destructiveSortedIterator(): Iterator[(K, V)] 方法，可以返回 Array 中排序后的 (K, V) pairs。实现方法很简单：先将所有 (K, V) pairs compact 到 Array 的前端，并使得每个 (K, V) 占一个位置（原来占两个），之后直接调用 Array.sort() 排序，不过这样做会破坏数组（key 的位置变化了）。
-
-#### ExternalAppendOnlyMap
-
-<div align="center"> <img src="../pics/lip_image011.png" width="500"/> </div><br>
-
-相比 AppendOnlyMap，ExternalAppendOnlyMap 的实现略复杂，但逻辑其实很简单，类似 Hadoop MapReduce 中的 shuffle-merge-combine-sort 过程：
-
-ExternalAppendOnlyMap 持有一个 AppendOnlyMap，shuffle 来的一个个 (K, V) record 先 insert 到 AppendOnlyMap 中，insert 过程与原始的 AppendOnlyMap 一模一样。如果 AppendOnlyMap 快被装满时检查一下内存剩余空间是否可以够扩展，够就直接在内存中扩展，不够就 sort 一下 AppendOnlyMap，将其内部所有 records 都 spill 到磁盘上。图中 spill 了 4 次，每次 spill 完在磁盘上生成一个 spilledMap 文件，然后重新 new 出来一个 AppendOnlyMap。最后一个 (K, V) record insert 到 AppendOnlyMap 后，表示所有 shuffle 来的 records 都被放到了 ExternalAppendOnlyMap 中，但不表示 records 已经被处理完，因为每次 insert 的时候，新来的 record 只与 AppendOnlyMap 中的 records 进行 aggregate，并不是与所有的 records 进行 aggregate（一些 records 已经被 spill 到磁盘上了）。因此当需要 aggregate 的最终结果时，需要对 AppendOnlyMap 和所有的 spilledMaps 进行全局 merge-aggregate。
-
-全局 merge-aggregate 的流程也很简单：先将 AppendOnlyMap 中的 records 进行 sort，形成 sortedMap。然后利用 DestructiveSortedIterator 和 DiskMapIterator 分别从 sortedMap 和各个 spilledMap 读出一部分数据（StreamBuffer）放到 mergeHeap 里面。StreamBuffer 里面包含的 records 需要具有相同的 hash(key)，所以图中第一个 spilledMap 只读出前三个 records 进入 StreamBuffer。mergeHeap 顾名思义就是使用堆排序不断提取出 hash(firstRecord.Key) 相同的 StreamBuffer，并将其一个个放入 mergeBuffers 中，放入的时候与已经存在于 mergeBuffers 中的 StreamBuffer 进行 merge-combine，第一个被放入 mergeBuffers 的 StreamBuffer 被称为 minBuffer，那么 minKey 就是 minBuffer 中第一个 record 的 key。当 merge-combine 的时候，与 minKey 相同的 records 被 aggregate 一起，然后输出。整个 merge-combine 在 mergeBuffers 中结束后，StreamBuffer 剩余的 records 随着 StreamBuffer 重新进入 mergeHeap。一旦某个 StreamBuffer 在 merge-combine 后变为空（里面的 records 都被输出了），那么会使用 DestructiveSortedIterator 或 DiskMapIterator 重新装填 hash(key) 相同的 records，然后再重新进入 mergeHeap。
-
-整个 insert-merge-aggregate 的过程有三点需要进一步探讨一下：
-
-- 内存剩余空间检测
-
-与 Hadoop MapReduce 规定 reducer 中 70% 的空间可用于 shuffle-sort 类似，Spark 也规定 executor 中 spark.shuffle.memoryFraction * spark.shuffle.safetyFraction 的空间（默认是0.3 * 0.8）可用于 ExternalOnlyAppendMap。Spark 略保守是不是？更保守的是这 24％ 的空间不是完全用于一个 ExternalOnlyAppendMap 的，而是由在 executor 上同时运行的所有 reducer 共享的。为此，exectuor 专门持有一个 ShuffleMemroyMap: HashMap[threadId, occupiedMemory] 来监控每个 reducer 中 ExternalOnlyAppendMap 占用的内存量。每当 AppendOnlyMap 要扩展时，都会计算 ShuffleMemroyMap 持有的所有 reducer 中的 AppendOnlyMap 已占用的内存 ＋ 扩展后的内存 是会否会大于内存限制，大于就会将 AppendOnlyMap spill 到磁盘。有一点需要注意的是前 1000 个 records 进入 AppendOnlyMap 的时候不会启动是否要 spill 的检查，需要扩展时就直接在内存中扩展。
-
-- AppendOnlyMap 大小估计
-
-为了获知 AppendOnlyMap 占用的内存空间，可以在每次扩展时都将 AppendOnlyMap reference 的所有 objects 大小都算一遍，然后加和，但这样做非常耗时。所以 Spark 设计了粗略的估算算法，算法时间复杂度是 O(1)，核心思想是利用 AppendOnlyMap 中每次 insert-aggregate record 后 result 的大小变化及一共 insert 的 records 的个数来估算大小，具体见 SizeTrackingAppendOnlyMap 和 SizeEstimator。
-
-- Spill 过程
-
-与 shuffle write 一样，在 spill records 到磁盘上的时候，会建立一个 buffer 缓冲区，大小仍为 spark.shuffle.file.buffer.kb ，默认是 32KB。另外，由于 serializer 也会分配缓冲区用于序列化和反序列化，所以如果一次 serialize 的 records 过多的话缓冲区会变得很大。Spark 限制每次 serialize 的 records 个数为 spark.shuffle.spill.batchSize，默认是 10000。
-
- 
-
-来自 <<https://github.com/JerryLead/SparkInternals/blob/master/markdown/4-shuffleDetails.md>>
-
- 
-
- 
-
- 
-
-reduce如何获取map任务的输出 （shuffle read）
+### reduce如何获取map任务的输出 （shuffle read）
 
 <https://imcoder.site/article.do?method=detail&aid=169#fetchDataDetail>
 
 <div align="center"> <img src="../pics/lip_image012.png" width="500"/> </div><br>
 
- 
+模块：
 
-MapOutputTracker是Spark架构中的一个模块，是一个主从架构。管理磁盘小文件的地址。
+- MapOutputTracker是Spark架构中的一个模块，是一个主从架构。管理磁盘小文件的地址。
+- MapOutputTrackerMaster是主对象，存在于Driver中。
+- MapOutputTrackerWorker是从对象，存在于Excutor中。将小文件地址报告给MapOutputTrackerMaster
+- ReduceTask通过MapOutputTrackerMaster获得小文件地址，而真正拉取是通过Executor中的Block Manager拉取的。
 
- 
+过程：
 
-​                MapOutputTrackerMaster是主对象，存在于Driver中。
-
- 
-
-​                MapOutputTrackerWorker是从对象，存在于Excutor中。将小文件地址报告给MapOutputTrackerMaster
-
- 
-
-​        ReduceTask通过MapOutputTrackerMaster获得小文件地址，而真正拉取是通过Executor中的Block Manager拉取的。
-
- MaskTask 执行完成后会产生很多磁盘小文件
-
- 
-
-​        这时 task 会将 task的执行状态与结果   以及 这些磁盘文件的地址  封装到 mapStatus  对象中，通过本地的 MapOutputTrackerWorker 向 Driver 的 DAGScheduler 里的 MapOutputTrackerMaster 汇报。
-
- 
-
-​        ReduceTask 执行前，首先会向本地 MapOutputTrackerWorker  这些磁盘小文件的 地址  ，如果没有就会向 MapOutputTrackerMaster 申请  。
-
- 
-
-​        得到地址后，ReduceTask 会 通过 Executor 中的 BlockManagerSlave 的 ConnectionManager  向 MapTask 所在的 Executor 中的 BlockManagerSlave 的 ConnectionManager 建立连接。
-
- 
-
-​        后通过 BlockTransferService拉取数据 ， BlockTransforService 会创建 5 个线程 去 map 端拉取，这 5 个线程 拉取的数据总共不能超过 48 M  。
-
- 
-
-​        拉取的数据存储再 Executor 的 shuffle 聚合内存 里。
+1. MaskTask 执行完成后会产生很多磁盘小文件
+2. task将 task的执行状态与结果以及这些磁盘文件的地址封装到mapStatus对象中，通过本地的 MapOutputTrackerWorker向Driver的DAGScheduler里的MapOutputTrackerMaster汇报。
+3. ReduceTask执行前，首先会向本地MapOutputTrackerWorker这些磁盘小文件的地址，如果没有就会向 MapOutputTrackerMaster申请。
+4. 得到地址后，ReduceTask会通过Executor中的BlockManagerSlave 的ConnectionManager向MapTask所在的 Executor 中的 BlockManagerSlave 的 ConnectionManager 建立连接。
+5. 后通过BlockTransferService拉取数据 ，BlockTransforService会创建5个线程去map端拉取，这5个线程拉取的数据总共不能超过48M，拉取的数据存储再 Executor 的 shuffle 聚合内存里。
 
 那么问题就来了：
 
-- - 在什么时候 fetch，parent stage 中的一个 ShuffleMapTask 执行完还是等全部 ShuffleMapTasks 执行完？
-  - 边 fetch 边处理还是一次性 fetch 完再处理？
-  - fetch 来的数据存放到哪里？
-  - 怎么获得要 fetch 的数据的存放位置？
+- 在什么时候 fetch，parent stage 中的一个 ShuffleMapTask 执行完还是等全部 ShuffleMapTasks 执行完？
+- 边 fetch 边处理还是一次性 fetch 完再处理？
+- fetch 来的数据存放到哪里？
+- 怎么获得要 fetch 的数据的存放位置？
 
 来自 <<https://github.com/JerryLead/SparkInternals/blob/master/markdown/4-shuffleDetails.md>>
 
 解决问题：
 
-- - **在什么时候 fetch？**当 parent stage 的所有 ShuffleMapTasks 结束后再 fetch。理论上讲，一个 ShuffleMapTask 结束后就可以 fetch，但是为了迎合 stage 的概念（即一个 stage 如果其 parent stages 没有执行完，自己是不能被提交执行的），还是选择全部 ShuffleMapTasks 执行完再去 fetch。因为 fetch 来的 FileSegments 要先在内存做缓冲，所以一次 fetch 的 FileSegments 总大小不能太大。Spark 规定这个缓冲界限不能超过 spark.reducer.maxMbInFlight，这里用 softBuffer 表示，默认大小为 48MB。一个 softBuffer 里面一般包含多个 FileSegment，但如果某个 FileSegment 特别大的话，这一个就可以填满甚至超过 softBuffer 的界限。
-  - **边 fetch 边处理还是一次性 fetch 完再处理？**边 fetch 边处理。本质上，MapReduce shuffle 阶段就是边 fetch 边使用 combine() 进行处理，只是 combine() 处理的是部分数据。MapReduce 为了让进入 reduce() 的 records 有序，必须等到全部数据都 shuffle-sort 后再开始 reduce()。因为 Spark 不要求 shuffle 后的数据全局有序，因此没必要等到全部数据 shuffle 完成后再处理。**那么如何实现边 shuffle 边处理，而且流入的 records 是无序的？**答案是使用可以 aggregate 的数据结构，比如 HashMap。每 shuffle 得到（从缓冲的 FileSegment 中 deserialize 出来）一个 <Key, Value> record，直接将其放进 HashMap 里面。如果该 HashMap 已经存在相应的 Key，那么直接进行 aggregate 也就是 func(hashMap.get(Key), Value)，比如上面 WordCount 例子中的 func 就是 hashMap.get(Key) ＋ Value，并将 func 的结果重新 put(key) 到 HashMap 中去。这个 func 功能上相当于 reduce()，但实际处理数据的方式与 MapReduce reduce() 有差别，差别相当于下面两段程序的差别。
+- **在什么时候 fetch?**
 
+  当 parent stage的所有ShuffleMapTasks结束后再 fetch。理论上讲，一个 ShuffleMapTask结束后就可以fetch，但是为了迎合stage的概念(即一个stage如果其parent stages没有执行完，自己是不能被提交执行的)，还是选择全部ShuffleMapTasks执行完再去fetch。因为fetch来的 FileSegments要先在内存做缓冲，所以一次fetch的FileSegments总大小不能太大。这个缓冲界限不能超过spark.reducer.maxMbInFlight，这里用 softBuffer 表示，默认大小为48MB。一个softBuffer 里面一般包含多个FileSegment，但如果某个FileSegment特别大，这一个就可以填满甚至超过softBuffer 的界限。
+
+- **边 fetch 边处理还是一次性 fetch 完再处理？**
+
+  边 fetch 边处理。本质上，MapReduce shuffle 阶段就是边 fetch 边使用 combine() 进行处理，只是 combine() 处理的是部分数据。MapReduce 为了让进入 reduce() 的 records 有序，必须等到全部数据都 shuffle-sort 后再开始 reduce()。因为 Spark 不要求 shuffle 后的数据全局有序，因此没必要等到全部数据 shuffle 完成后再处理。
+
+- **那么如何实现边 shuffle 边处理，而且流入的 records 是无序的？**
+
+  答案是使用可以 aggregate 的数据结构，比如 HashMap。每 shuffle 得到（从缓冲的 FileSegment 中 deserialize 出来）一个 <Key, Value> record，直接将其放进 HashMap 里面。如果该 HashMap 已经存在相应的 Key，那么直接进行 aggregate 也就是 func(hashMap.get(Key), Value)，比如上面 WordCount 例子中的 func 就是 hashMap.get(Key) ＋ Value，并将 func 的结果重新 put(key) 到 HashMap 中去。这个 func 功能上相当于 reduce()，但实际处理数据的方式与 MapReduce reduce() 有差别，差别相当于下面两段程序的差别。
+
+```java
  // MapReduce
-
  reduce(K key, Iterable<V> values) {
-
-​         result = process(key, values)
-
-​         return result        
-
+        result = process(key, values)
+        return result        
  }
+```
 
-
-
+```scala
 // Spark
 
  reduce(K key, Iterable<V> values) {
@@ -566,140 +497,117 @@ MapOutputTracker是Spark架构中的一个模块，是一个主从架构。管�
 ​         return result
 
  }
+```
 
-MapReduce 可以在 process 函数里面可以定义任何数据结构，也可以将部分或全部的 values 都 cache 后再进行处理，非常灵活。而 Spark 中的 func 的输入参数是固定的，一个是上一个 record 的处理结果，另一个是当前读入的 record，它们经过 func 处理后的结果被下一个 record 处理时使用。因此一些算法比如求平均数，在 process 里面很好实现，直接sum(values)/values.length，而在 Spark 中 func 可以实现sum(values)，但不好实现/values.length。更多的 func 将会在下面的章节细致分析。
+​	MapReduce 可以在 process 函数里面可以定义任何数据结构，也可以将部分或全部的 values 都 cache 后再进行处理，非常灵活。而 Spark 中的 func 的输入参数是固定的，一个是上一个 record 的处理结果，另一个是当前读入的 record，它们经过 func 处理后的结果被下一个 record 处理时使用。因此一些算法比如求平均数，在 process 里面很好实现，直接sum(values)/values.length，而在 Spark 中 func 可以实现sum(values)，但不好实现/values.length。更多的 func 将会在下面的章节细致分析。
 
-- - **fetch 来的数据存放到哪里？**刚 fetch 来的 FileSegment 存放在 softBuffer 缓冲区，经过处理后的数据放在内存 + 磁盘上。这里我们主要讨论处理后的数据，可以灵活设置这些数据是“只用内存”还是“内存＋磁盘”。如果spark.shuffle.spill = false就只用内存。内存使用的是AppendOnlyMap ，类似 Java 的HashMap，内存＋磁盘使用的是ExternalAppendOnlyMap，如果内存空间不足时，ExternalAppendOnlyMap可以将 <K, V> records 进行 sort 后 spill 到磁盘上，等到需要它们的时候再进行归并，后面会详解。**使用“内存＋磁盘”的一个主要问题就是如何在两者之间取得平衡？**在 Hadoop MapReduce 中，默认将 reducer 的 70% 的内存空间用于存放 shuffle 来的数据，等到这个空间利用率达到 66% 的时候就开始 merge-combine()-spill。在 Spark 中，也适用同样的策略，一旦 ExternalAppendOnlyMap 达到一个阈值就开始 spill，具体细节下面会讨论。
-  - **怎么获得要 fetch 的数据的存放位置？**在上一章讨论物理执行图中的 stage 划分的时候，我们强调 “一个 ShuffleMapStage 形成后，会将该 stage 最后一个 final RDD 注册到 MapOutputTrackerMaster.registerShuffle(shuffleId, rdd.partitions.size)，这一步很重要，因为 shuffle 过程需要 MapOutputTrackerMaster 来指示 ShuffleMapTask 输出数据的位置”。因此，reducer 在 shuffle 的时候是要去 driver 里面的 MapOutputTrackerMaster 询问 ShuffleMapTask 输出的数据位置的。每个 ShuffleMapTask 完成时会将 FileSegment 的存储位置信息汇报给 MapOutputTrackerMaster。
+- **fetch 来的数据存放到哪里？**
+  刚 fetch 来的 FileSegment 存放在 softBuffer 缓冲区，经过处理后的数据放在内存 + 磁盘上。这里我们主要讨论处理后的数据，可以灵活设置这些数据是“只用内存”还是“内存＋磁盘”。如果spark.shuffle.spill = false就只用内存。内存使用的是AppendOnlyMap ，类似 Java 的HashMap，内存＋磁盘使用的是ExternalAppendOnlyMap，如果内存空间不足时，ExternalAppendOnlyMap可以将 <K, V> records 进行 sort 后 spill 到磁盘上，等到需要它们的时候再进行归并，后面会详解。
 
- 
+  **使用“内存＋磁盘”的一个主要问题就是如何在两者之间取得平衡？**
+  在 Hadoop MapReduce 中，默认将 reducer 的 70% 的内存空间用于存放 shuffle 来的数据，等到这个空间利用率达到 66% 的时候就开始 merge-combine()-spill。在 Spark 中，也适用同样的策略，一旦 ExternalAppendOnlyMap 达到一个阈值就开始 spill，具体细节下面会讨论
 
- 
+- **怎么获得要 fetch 的数据的存放位置？**
+  一个 ShuffleMapStage 形成后，会将该 stage 最后一个 final RDD 注册到 MapOutputTrackerMaster.registerShuffle(shuffleId, rdd.partitions.size)，这一步很重要，因为 shuffle 过程需要 MapOutputTrackerMaster 来指示 ShuffleMapTask 输出数据的位置。因此，reducer 在 shuffle 的时候是要去 driver 里面的 MapOutputTrackerMaster 询问 ShuffleMapTask 输出的数据位置的。每个 ShuffleMapTask 完成时会将 FileSegment 的存储位置信息汇报给 MapOutputTrackerMaster
 
- 
+### map端计算结果缓存处理并简述appendOnlyMap和 ExternalAppendOnlyMap
 
- 
+HashMap 是 Spark shuffle read 过程中频繁使用的、用于 aggregate 的数据结构。Spark 设计了两种：一种是全内存的 AppendOnlyMap，另一种是内存＋磁盘的 ExternalAppendOnlyMap。下面我们来分析一下两者特性及内存使用情况。
 
-Spark Shuffle调优
+#### AppendOnlyMap
 
-来自 <<https://imcoder.site/article.do?method=detail&aid=169#fetchDataDetail>>
+AppendOnlyMap 的官方介绍是 A simple open hash table optimized for the append-only use case, where keys are never removed, but the value for each key may be changed。意思是类似 HashMap，但没有remove(key)方法。其实现原理很简单，开一个大 Object 数组，蓝色部分存储 Key，白色部分存储 Value。如下图：
 
- 1、 增加MapTask写磁盘的  buffer缓冲大小  （默认32K）
+<div align="center"> <img src="../pics/lip_image010.png" width="500"/> </div><br>
 
-​    2、 增加 用于 shuffle聚合 的内存比例，可以适当降低其他 区域 的比例  (默认20% )
+当要 put(K, V) 时，先 hash(K) 找存放位置，如果存放位置已经被占用，就使用二次探测方法来找下一个空闲位置。对于图中的 K6 来说，第三次查找找到 K4 后面的空闲位置，放进去即可。get(K6) 的时候类似，找三次找到 K6，取出紧挨着的 V6，与先来的 value 做 func，结果重新放到 V6 的位置。
 
-​    3 、增加 Reduce Task 最大拉取的数据量 （默认48M）
+迭代 AppendOnlyMap 中的元素的时候，从前到后扫描输出。
 
-​    4、 增加 拉取数据失败的 重试次数 （默认3次） ， 可虑副作用。
+如果 Array 的利用率达到 70%，那么就扩张一倍，并对所有 key 进行 rehash 后，重新排列每个 key 的位置。
 
-​    5、 增大 拉取数据失败的 每次重试的间隔 （默认）
+AppendOnlyMap 还有一个 `destructiveSortedIterator(): Iterator[(K, V)]` 方法，可以返回 Array 中排序后的 (K, V) pairs。实现方法很简单：先将所有 (K, V) pairs compact 到 Array 的前端，并使得每个 (K, V) 占一个位置（原来占两个），之后直接调用 Array.sort() 排序，不过这样做会破坏数组（key 的位置变化了）。
 
-​    6、 选择 shuffle 的种类 （默认 SortShuffleManager）
+#### ExternalAppendOnlyMap
 
-​    7、 开启SortShuffleManager 的 合并机制 （默认 false）
+<div align="center"> <img src="../pics/lip_image011.png" width="500"/> </div><br>
 
-​    8、 SortShuffleManager 的 bypass 机制 （默认200）
+相比 AppendOnlyMap，ExternalAppendOnlyMap 的实现略复杂，但逻辑其实很简单，类似 Hadoop MapReduce 中的 shuffle-merge-combine-sort 过程：
 
-Spark reduce OOM解决办法
+ExternalAppendOnlyMap 持有一个 AppendOnlyMap，shuffle 来的一个个 (K, V) record 先 insert 到 AppendOnlyMap中，insert 过程与原始的 AppendOnlyMap 一模一样。如果 AppendOnlyMap 快被装满时检查一下内存剩余空间是否可以够扩展，够就直接在内存中扩展，不够就 sort 一下 AppendOnlyMap，将其内部所有 records 都 spill 到磁盘上。图中 spill 了 4 次，每次 spill 完在磁盘上生成一个 spilledMap 文件，然后重新 new 出来一个 AppendOnlyMap。最后一个 (K, V) record insert 到 AppendOnlyMap 后，表示所有 shuffle 来的 records 都被放到了 ExternalAppendOnlyMap 中，但不表示 records 已经被处理完，因为每次 insert 的时候，新来的 record 只与 AppendOnlyMap 中的 records 进行 aggregate，并不是与所有的 records 进行 aggregate（一些 records 已经被 spill 到磁盘上了）。因此当需要 aggregate 的最终结果时，需要对 AppendOnlyMap 和所有的 spilledMaps 进行全局 merge-aggregate。
 
-   1、减少拉取的数据量
+全局 merge-aggregate 的流程也很简单：先将 AppendOnlyMap 中的 records 进行 sort，形成 sortedMap。然后利用 DestructiveSortedIterator 和 DiskMapIterator 分别从 sortedMap 和各个spilledMap读出一部分数据(StreamBuffer)放到 mergeHeap 里面。StreamBuffer 里面包含的 records 需要具有相同的 hash(key)，所以图中第一个spilledMap只读出前三个records进入StreamBuffer。mergeHeap顾名思义就是使用堆排序不断提取出 hash(firstRecord.Key)相同的StreamBuffer，并将其一个个放入mergeBuffers中，放入的时候与已经存在于 mergeBuffers中的StreamBuffer进行merge-combine，第一个被放入mergeBuffers的StreamBuffer 被称为 minBuffer，那么minKey就是minBuffer中第一个record的key。当merge-combine的时候，与 minKey 相同的 records 被 aggregate 一起，然后输出。整个 merge-combine 在 mergeBuffers 中结束后，StreamBuffer 剩余的records随着 StreamBuffer 重新进入 mergeHeap。一旦某个 StreamBuffer 在merge-combine后变为空(里面的records都被输出了)，那么会使用 DestructiveSortedIterator 或 DiskMapIterator 重新装填 hash(key) 相同的 records，然后再重新进入 mergeHeap。
 
-​        2、增加shuffle聚合内存比例 （比较好，因为有的算子运算占用内存小，也可以减小持久化内存大小）
+整个 insert-merge-aggregate 的过程有三点需要进一步探讨一下：
 
-​        3、增加Executor的内存
+- **内存剩余空间检测**
 
-对比 Hadoop MapReduce 和 Spark 的 Shuffle 过程
+与 Hadoop MapReduce 规定 reducer 中 70% 的空间可用于 shuffle-sort 类似，Spark 也规定 executor 中 spark.shuffle.memoryFraction * spark.shuffle.safetyFraction 的空间（默认是0.3 * 0.8）可用于 ExternalOnlyAppendMap。Spark 略保守是不是？更保守的是这 24％ 的空间不是完全用于一个 ExternalOnlyAppendMap 的，而是由在 executor 上同时运行的所有 reducer 共享的。为此，exectuor 专门持有一个 ShuffleMemroyMap: HashMap[threadId, occupiedMemory] 来监控每个 reducer 中 ExternalOnlyAppendMap 占用的内存量。每当 AppendOnlyMap 要扩展时，都会计算 ShuffleMemroyMap 持有的所有 reducer 中的 AppendOnlyMap 已占用的内存 ＋ 扩展后的内存 是会否会大于内存限制，大于就会将 AppendOnlyMap spill 到磁盘。有一点需要注意的是前 1000 个 records 进入 AppendOnlyMap 的时候不会启动是否要 spill 的检查，需要扩展时就直接在内存中扩展。
+
+- **AppendOnlyMap 大小估计**
+
+为了获知 AppendOnlyMap 占用的内存空间，可以在每次扩展时都将 AppendOnlyMap reference 的所有 objects 大小都算一遍，然后加和，但这样做非常耗时。所以 Spark 设计了粗略的估算算法，算法时间复杂度是 O(1)，核心思想是利用 AppendOnlyMap 中每次 insert-aggregate record 后 result 的大小变化及一共 insert 的 records 的个数来估算大小，具体见 SizeTrackingAppendOnlyMap 和 SizeEstimator。
+
+- **Spill 过程**
+
+与 shuffle write 一样，在 spill records 到磁盘上的时候，会建立一个 buffer 缓冲区，大小仍为 spark.shuffle.file.buffer.kb ，默认是 32KB。另外，由于 serializer 也会分配缓冲区用于序列化和反序列化，所以如果一次 serialize 的 records 过多的话缓冲区会变得很大。Spark 限制每次 serialize 的 records 个数为 spark.shuffle.spill.batchSize，默认是 10000。
 
 来自 <<https://github.com/JerryLead/SparkInternals/blob/master/markdown/4-shuffleDetails.md>>
 
  
 
-从 high-level 的角度来看，两者并没有大的差别。 都是将 mapper（Spark 里是 ShuffleMapTask）的输出进行 partition，不同的 partition 送到不同的 reducer（Spark 里 reducer 可能是下一个 stage 里的 ShuffleMapTask，也可能是 ResultTask）。Reducer 以内存作缓冲区，边 shuffle 边 aggregate 数据，等到数据 aggregate 好以后进行 reduce() （Spark 里可能是后续的一系列操作）。
 
-从 low-level 的角度来看，两者差别不小。 Hadoop MapReduce 是 sort-based，进入 combine() 和 reduce() 的 records 必须先 sort。这样的好处在于 combine/reduce() 可以处理大规模的数据，因为其输入数据可以通过外排得到（mapper 对每段数据先做排序，reducer 的 shuffle 对排好序的每段数据做归并）。目前的 Spark 默认选择的是 hash-based，通常使用 HashMap 来对 shuffle 来的数据进行 aggregate，不会对数据进行提前排序。如果用户需要经过排序的数据，那么需要自己调用类似 sortByKey() 的操作；如果你是Spark 1.1的用户，可以将spark.shuffle.manager设置为sort，则会对数据进行排序。在Spark 1.2中，sort将作为默认的Shuffle实现。
+### Spark Shuffle调优
 
-从实现角度来看，两者也有不少差别。 Hadoop MapReduce 将处理流程划分出明显的几个阶段：map(), spill, merge, shuffle, sort, reduce() 等。每个阶段各司其职，可以按照过程式的编程思想来逐一实现每个阶段的功能。在 Spark 中，没有这样功能明确的阶段，只有不同的 stage 和一系列的 transformation()，所以 spill, merge, aggregate 等操作需要蕴含在 transformation() 中。
+来自 <<https://imcoder.site/article.do?method=detail&aid=169#fetchDataDetail>>
+
+1. 增加MapTask写磁盘的buffer缓冲大小（默认32K）
+
+2. 增加用于shuffle聚合的内存比例，可以适当降低其他区域的比例  (默认20% )
+
+3. 增加Reduce Task最大拉取的数据量 （默认48M）
+
+4. 增加拉取数据失败的重试次数（默认3次），可虑副作用。
+
+5. 增大拉取数据失败的每次重试的间隔 （默认）
+6. 选择shuffle的种类（默认SortShuffleManager）
+7. 开启SortShuffleManager的合并机制 （默认 false）
+
+8. SortShuffleManager的bypass机制 （默认200）
+
+
+**Spark reduce OOM解决办法:**
+
+1. 减少拉取的数据量
+
+2. 增加shuffle聚合内存比例 （比较好，因为有的算子运算占用内存小，也可以减小持久化内存大小）
+
+3. 增加Executor的内存
 
 
 
-Spark中repartition与coalesce的区别
+
+### 对比 Hadoop MapReduce 和 Spark 的 Shuffle 过程
+
+来自 <<https://github.com/JerryLead/SparkInternals/blob/master/markdown/4-shuffleDetails.md>>
+
+ 
+
+从 high-level 的角度来看，两者并没有大的差别。 都是将 mapper (Spark 里是ShuffleMapTask)的输出进行 partition，不同的partition送到不同的reducer (Spark里reducer可能是下一个stage里的ShuffleMapTask，也可能是 ResultTask) 。Reducer以内存作缓冲区，边shuffle边aggregate数据，等到数据aggregate好以后进行 reduce (Spark里可能是后续的一系列操作)。
+
+从 low-level 的角度来看，两者差别不小。 Hadoop MapReduce 是 sort-based，进入 combine() 和 reduce() 的 records 必须先 sort。这样的好处在于 combine/reduce() 可以处理大规模的数据，因为其输入数据可以通过外排得到(mapper对每段数据先做排序，reducer的shuffle对排好序的每段数据做归并)。目前的Spark 默认选择的是 hash-based，通常使用 HashMap 来对shuffle来的数据进行aggregate，不会对数据进行提前排序。如果用户需要经过排序的数据，那么需要自己调用类似sortByKey()的操作；如果你是Spark 1.1的用户，可以将spark.shuffle.manager设置为sort，则会对数据进行排序。在Spark 1.2中，sort将作为默认的Shuffle实现。
+
+从实现角度来看，两者也有不少差别。 Hadoop MapReduce 将处理流程划分出明显的几个阶段：map(), spill, merge, shuffle, sort, reduce() 等。每个阶段各司其职，可以按照过程式的编程思想来逐一实现每个阶段的功能。在Spark中，没有这样功能明确的阶段，只有不同的 stage 和一系列的 transformation()，所以 spill, merge, aggregate 等操作需要蕴含在 transformation() 中。
+
+## 其他
+
+### Spark中repartition与coalesce的区别
+
+ 
+
+### Spark中的cache和checkpoint
 
  
 
  
 
-Spark中的cache和checkpoint
-
- 
-
- 
-
-Spark join的几种形式
-
- 
-
-Broadcast Join
-
-大家知道，在数据库的常见模型中（比如星型模型或者雪花模型），表一般分为两种：事实表和维度表。维度表一般指固定的、变动较少的表，例如联系人、物品种类等，一般数据有限。而事实表一般记录流水，比如销售清单等，通常随着时间的增长不断膨胀。
-
-因为Join操作是对两个表中key值相同的记录进行连接，在SparkSQL中，对两个表做Join最直接的方式是先根据key分区，再在每个分区中把key值相同的记录拿出来做连接操作。但这样就不可避免地涉及到shuffle，而shuffle在Spark中是比较耗时的操作，我们应该尽可能的设计Spark应用使其避免大量的shuffle。
-
-当维度表和事实表进行Join操作时，为了避免shuffle，我们可以将大小有限的维度表的全部数据分发到每个节点上，供事实表使用。executor存储维度表的全部数据，一定程度上牺牲了空间，换取shuffle操作大量的耗时，这在SparkSQL中称作Broadcast Join，如下图所示：
-
-<div align="center"> <img src="../pics/lip_image013.png" width="500"/> </div><br>
-
-Table B是较小的表，黑色表示将其广播到每个executor节点上，Table A的每个partition会通过block manager取到Table A的数据。根据每条记录的Join Key取到Table B中相对应的记录，根据Join Type进行操作。这个过程比较简单，不做赘述。
-
-Broadcast Join的条件有以下几个：
-
-\1. 被广播的表需要小于spark.sql.autoBroadcastJoinThreshold所配置的值，默认是10M （或者加了broadcast join的hint）
-
-\2. 基表不能被广播，比如left outer join时，只能广播右表
-
-看起来广播是一个比较理想的方案，但它有没有缺点呢？也很明显。这个方案只能用于广播较小的表，否则数据的冗余传输就远大于shuffle的开销；另外，广播时需要将被广播的表现collect到driver端，当频繁有广播出现时，对driver的内存也是一个考验。
-
- 
-
-Shuffle Hash Join
-
-当一侧的表比较小时，我们选择将其广播出去以避免shuffle，提高性能。但因为被广播的表首先被collect到driver段，然后被冗余分发到每个executor上，所以当表比较大时，采用broadcast join会对driver端和executor端造成较大的压力。
-
-但由于Spark是一个分布式的计算引擎，可以通过分区的形式将大批量的数据划分成n份较小的数据集进行并行计算。这种思想应用到Join上便是Shuffle Hash Join了。利用key相同必然分区相同的这个原理，SparkSQL将较大表的join分而治之，先将表划分成n个分区，再对两个表中相对应分区的数据分别进行Hash Join，这样即在一定程度上减少了driver广播一侧表的压力，也减少了executor端取整张被广播表的内存消耗。其原理如下图：
-
-<div align="center"> <img src="../pics/lip_image014.png" width="500"/> </div><br>
-
-Shuffle Hash Join分为两步：
-
-\1. 对两张表分别按照join keys进行重分区，即shuffle，目的是为了让有相同join keys值的记录分到对应的分区中
-
-\2. 对对应分区中的数据进行join，此处先将小表分区构造为一张hash表，然后根据大表分区中记录的join keys值拿出来进行匹配
-
-Shuffle Hash Join的条件有以下几个：
-
-\1. 分区的平均大小不超过spark.sql.autoBroadcastJoinThreshold所配置的值，默认是10M 
-
-\2. 基表不能被广播，比如left outer join时，只能广播右表
-
-\3. 一侧的表要明显小于另外一侧，小的一侧将被广播（明显小于的定义为3倍小，此处为经验值）
-
-我们可以看到，在一定大小的表中，SparkSQL从时空结合的角度来看，将两个表进行重新分区，并且对小表中的分区进行hash化，从而完成join。在保持一定复杂度的基础上，尽量减少driver和executor的内存压力，提升了计算时的稳定性。
-
-Sort Merge Join
-
-上面介绍的两种实现对于一定大小的表比较适用，但当两个表都非常大时，显然无论适用哪种都会对计算内存造成很大压力。这是因为join时两者采取的都是hash join，是将一侧的数据完全加载到内存中，使用hash code取join keys值相等的记录进行连接。
-
-当两个表都非常大时，SparkSQL采用了一种全新的方案来对表进行Join，即Sort Merge Join。这种实现方式不用将一侧数据全部加载后再进星hash join，但需要在join前将数据排序，如下图所示：
-
-<div align="center"> <img src="../pics/lip_image015.png" width="500"/> </div><br>
-
-可以看到，首先将两张表按照join keys进行了重新shuffle，保证join keys值相同的记录会被分在相应的分区。分区后对每个分区内的数据进行排序，排序后再对相应的分区内的记录进行连接，如下图示：
-
-<div align="center"> <img src="../pics/lip_image016.png" width="500"/> </div><br>
-
-看着很眼熟吧？也很简单，因为两个序列都是有序的，从头遍历，碰到key相同的就输出；如果不同，左边小就继续取左边，反之取右边。
-
-可以看出，无论分区有多大，Sort Merge Join都不用把某一侧的数据全部加载到内存中，而是即用即取即丢，从而大大提升了大数据量下sql join的稳定性。
-
- 
-
-来自 <<https://blog.csdn.net/asongoficeandfire/article/details/53574034>>
