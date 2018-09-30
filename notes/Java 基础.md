@@ -171,7 +171,7 @@ public final class String
 
 如果一个 String 对象已经被创建过了，那么就会从 String Pool 中取得引用。只有 String 是不可变的，才可能使用 String Pool。
 
-<div align="center"> <img src="../pics//f76067a5-7d5f-4135-9549-8199c77d8f1c.jpg" width=""/> </div><br>
+<div align="center"> <img src="../pics/f76067a5-7d5f-4135-9549-8199c77d8f1c.jpg" width=""/> </div><br>
 
 **3. 安全性** 
 
@@ -1305,7 +1305,7 @@ Throwable 可以用来表示任何可以作为异常抛出的类，分为两种�
 -  **受检异常** ：需要用 try...catch... 语句捕获并进行处理，并且可以从异常中恢复；或者在方法签名里通过throws子句声明.受检查的异常必须在编译时被捕捉处理。如果不处理,程序就不能编译通过。如IOException、 SQLException等以及用户自定义的Exception异常,一般情况下不自定义检查异常。
 -  **非受检异常** ：是程序运行时错误，例如除 0 会引发 Arithmetic Exception，此时程序崩溃并且无法恢复。运行时异常都是RuntimeException类及其子类异常,如NullPointerException、IndexOutOfBoundsException等,这些异常是不检查异常,程序中可以选择捕获处理,也可以不处理。这些异常一般是由程序逻辑错误引起的,程序应该从逻辑角度尽可能避免这类异常的发生。
 
-<div align="center"> <img src="../pics//PPjwP.png" width="600"/> </div><br>
+<div align="center"> <img src="../pics/PPjwP.png" width="600"/> </div><br>
 
 - [Java 入门之异常处理](https://www.tianmaying.com/tutorial/Java-Exception)
 - [Java 异常的面试问题及答案 -Part 1](http://www.importnew.com/7383.html)
